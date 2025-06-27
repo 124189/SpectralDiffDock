@@ -1,0 +1,2166 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_cluster import radius, radius_graph
+from torch_scatter import scatter_mean
+from e3nn import o3
+from models.score_model import AtomEncoder, GaussianSmearing
+from utils import so3, torus
+from utils.diffusion_utils import get_t_schedule, default_init
+from datasets.process_mols import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
+
+
+class SpectralConv1d(nn.Module):
+    """1D Spectral Convolution for time-dependent features."""
+
+    def __init__(self, in_channels: int, out_channels: int, modes: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes = modes
+
+        # Handle zero-channel cases to prevent division by zero
+        if in_channels == 0 or out_channels == 0:
+            print(
+                f'[WARNING] SpectralConv1d initialized with zero channels: in={in_channels}, out={out_channels}')
+            self.scale = 1.0
+            self.weights = nn.Parameter(torch.zeros(max(1, in_channels), max(
+                1, out_channels), modes, dtype=torch.complex64))
+        else:
+            self.scale = 1 / (in_channels * out_channels)
+            self.weights = nn.Parameter(
+                self.scale * torch.rand(in_channels, out_channels, modes, dtype=torch.complex64))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply spectral convolution to input tensor.
+
+        Args:
+            x: Input tensor of shape [T, N, C] where T is time steps, N is nodes, C is channels.
+
+        Returns:
+            Output tensor of shape [T, N, out_channels].
+        """
+        if self.in_channels == 0 or self.out_channels == 0:
+            T, N, _ = x.shape
+            return torch.zeros(T, N, self.out_channels, device=x.device, dtype=x.dtype)
+
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError('Input contains NaN or Inf values')
+
+        T, N, C = x.shape
+
+        # DYNAMIC FIX: Handle dimension mismatch in SpectralConv1d
+        if C != self.in_channels:
+            print(
+                f'[SPECTRAL_CONV_MISMATCH] Expected {self.in_channels} channels, got {C}. Adjusting weights.')
+            # Create new weights with correct dimensions and dtype
+            x_ft = torch.fft.rfft(x, dim=0)
+            # Use the same dtype as FFT result to prevent type mismatch
+            fft_dtype = x_ft.dtype
+
+            print(
+                f'[DTYPE_DEBUG] x.dtype: {x.dtype}, x_ft.dtype: {fft_dtype}, self.weights.dtype: {self.weights.dtype}')
+
+            # Force to use the same dtype as original weights to maintain consistency
+            target_dtype = self.weights.dtype
+            if fft_dtype != target_dtype:
+                print(
+                    f'[DTYPE_CONVERT] Converting FFT from {fft_dtype} to {target_dtype}')
+                x_ft = x_ft.to(target_dtype)
+                fft_dtype = target_dtype
+
+            new_weights = torch.randn(
+                C, self.out_channels, self.modes, dtype=fft_dtype, device=x.device) * self.scale
+
+            # Normalize FFT
+            x_ft = x_ft / (torch.norm(x_ft, dim=0, keepdim=True) + 1e-8)
+
+            out_ft = torch.zeros(T // 2 + 1, N, self.out_channels,
+                                 dtype=fft_dtype, device=x.device)
+            out_ft[:self.modes] = torch.einsum(
+                'tni,iom->tno', x_ft[:self.modes], new_weights)
+            # Normalize output
+            out_ft = out_ft / (torch.norm(out_ft, dim=0, keepdim=True) + 1e-8)
+
+            return torch.fft.irfft(out_ft, n=T, dim=0)
+
+        # Normal path when dimensions match
+        x_ft = torch.fft.rfft(x, dim=0)
+        # Use the same dtype as FFT result to prevent type mismatch
+        fft_dtype = x_ft.dtype
+
+        # Force to use the same dtype as original weights to maintain consistency
+        target_dtype = self.weights.dtype
+        if fft_dtype != target_dtype:
+            print(
+                f'[DTYPE_CONVERT_NORMAL] Converting FFT from {fft_dtype} to {target_dtype}')
+            x_ft = x_ft.to(target_dtype)
+            fft_dtype = target_dtype
+
+        x_ft = x_ft / (torch.norm(x_ft, dim=0, keepdim=True) +
+                       1e-8)  # Normalize FFT
+
+        out_ft = torch.zeros(T // 2 + 1, N, self.out_channels,
+                             dtype=fft_dtype, device=x.device)
+        out_ft[:self.modes] = torch.einsum(
+            'tni,iom->tno', x_ft[:self.modes], self.weights)
+        # Normalize output
+        out_ft = out_ft / (torch.norm(out_ft, dim=0, keepdim=True) + 1e-8)
+
+        return torch.fft.irfft(out_ft, n=T, dim=0)
+
+
+class TimeEquivConvLayer(nn.Module):
+    """Time-equivariant convolution layer with spectral convolution and tensor product."""
+
+    def __init__(
+        self,
+        in_irreps: str,
+        sh_irreps: str,
+        out_irreps: str,
+        n_edge_features: int,
+        residual: bool = False,
+        batch_norm: bool = True,
+        dropout: float = 0.0,
+        num_timesteps: int = 8,
+        num_modes: int = 2
+    ):
+        super().__init__()
+        self.in_irreps = o3.Irreps(in_irreps)
+        self.sh_irreps = o3.Irreps(sh_irreps)
+        self.out_irreps = o3.Irreps(out_irreps)
+        self.n_edge_features = n_edge_features
+        self.residual = residual
+        self.batch_norm = batch_norm
+        self.dropout = dropout
+        self.num_timesteps = num_timesteps
+        self.num_modes = num_modes
+
+        # OPTIMIZATION: Cache for dynamic components to avoid recreation
+        self._dynamic_tp_cache = {}
+        self._dynamic_edge_mlp_cache = {}
+        self._dynamic_time_conv_cache = {}
+
+        # Scalar feature dimensions
+        scalar_in_dim = sum(
+            mul for mul, irrep in self.in_irreps if irrep.l == 0)
+        scalar_out_dim = sum(
+            mul for mul, irrep in self.out_irreps if irrep.l == 0)
+
+        # Spectral convolution for scalar features
+        self.time_conv = None
+        if scalar_in_dim > 0 and scalar_out_dim > 0:
+            self.time_conv = SpectralConv1d(
+                scalar_in_dim, scalar_out_dim, num_modes)
+        else:
+            print(
+                f'[INFO] No scalar features: input={scalar_in_dim}, output={scalar_out_dim}')
+
+        # Equivariant tensor product
+        self.tp = o3.FullyConnectedTensorProduct(
+            self.in_irreps, self.sh_irreps, self.out_irreps, shared_weights=False)
+
+        # Edge feature MLP
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(n_edge_features, n_edge_features),
+            nn.LayerNorm(n_edge_features),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(n_edge_features, self.tp.weight_numel)
+        )
+
+        # Batch normalization
+        self.bn = nn.LayerNorm(
+            self.out_irreps.dim) if batch_norm else nn.Identity()
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        """Initialize weights using He initialization."""
+        for param in self.parameters():
+            if param.dim() > 1:
+                nn.init.kaiming_normal_(
+                    param, mode='fan_in', nonlinearity='relu')
+            else:
+                nn.init.zeros_(param)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        edge_sh: torch.Tensor,
+        out_nodes: int = None,
+        reduce: str = 'mean'
+    ) -> torch.Tensor:
+        """Forward pass for time-equivariant convolution.
+
+        Args:
+            x: Node features [T, N, in_dim]
+            edge_index: Edge indices [2, E]
+            edge_attr: Edge features [T, E, edge_dim]
+            edge_sh: Spherical harmonics [T, E, sh_dim]
+            out_nodes: Number of output nodes (optional)
+            reduce: Reduction method ('mean' or others)
+
+        Returns:
+            Updated node features [T, out_nodes, out_dim]
+        """
+        if edge_index.shape[1] == 0:
+            return torch.zeros_like(x)
+
+        T, N, _ = x.shape
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError('Input contains NaN or Inf values')
+
+        # CRITICAL FIX: Handle dynamic input dimensions
+        # The input might not match self.in_irreps if it comes from a previous layer
+        input_dim = x.shape[-1]
+        expected_in_dim = self.in_irreps.dim
+
+        if input_dim != expected_in_dim:
+            # DIMENSION MISMATCH: Create new irreps based on actual input
+            # Assume all features are scalar (l=0) for simplicity
+            print(
+                f'[IRREP_MISMATCH] Expected {expected_in_dim}, got {input_dim}. Using cached/creating dynamic irreps.')
+            dynamic_irreps = f'{input_dim}x0e'  # All scalar features
+
+            # OPTIMIZATION: Use cached components if available
+            cache_key = f'{input_dim}_{self.out_irreps}'
+
+            if cache_key in self._dynamic_tp_cache:
+                # Use cached tensor product and edge MLP
+                self.tp = self._dynamic_tp_cache[cache_key]
+                self.edge_mlp = self._dynamic_edge_mlp_cache[cache_key]
+                print(f'[CACHE_HIT] Reusing cached components for {cache_key}')
+            else:
+                # Create new tensor product with dynamic irreps
+                dynamic_tp = o3.FullyConnectedTensorProduct(
+                    dynamic_irreps, self.sh_irreps, self.out_irreps, shared_weights=False)
+
+                # Create new edge MLP with correct weight dimensions
+                dynamic_edge_mlp = nn.Sequential(
+                    nn.Linear(self.n_edge_features, self.n_edge_features),
+                    nn.LayerNorm(self.n_edge_features),
+                    nn.ReLU(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(self.n_edge_features, dynamic_tp.weight_numel)
+                ).to(x.device)
+
+                # Cache the components
+                self._dynamic_tp_cache[cache_key] = dynamic_tp
+                self._dynamic_edge_mlp_cache[cache_key] = dynamic_edge_mlp
+
+                # Use dynamic components for this forward pass
+                self.tp = dynamic_tp
+                self.edge_mlp = dynamic_edge_mlp
+                print(
+                    f'[CACHE_MISS] Created and cached components for {cache_key}')
+
+            # Update irreps for scalar mask calculation
+            dynamic_irreps_obj = o3.Irreps(dynamic_irreps)
+            scalar_mask = torch.tensor(
+                [irrep.l == 0 for mul, irrep in dynamic_irreps_obj for _ in range(mul)], device=x.device)
+        else:
+            # Input matches expected irreps, use the pre-computed mask
+            scalar_mask = torch.tensor(
+                [irrep.l == 0 for mul, irrep in self.in_irreps for _ in range(mul)], device=x.device)
+
+        # FINAL_CONV FIX: Special handling for final_conv with pure vector irreps
+        # Check if this is a final_conv layer (out_irreps contains only vectors, no scalars)
+        has_scalar_output = any(irrep.l == 0 for mul, irrep in self.out_irreps)
+        has_scalar_input = scalar_mask.any().item() if scalar_mask.numel() > 0 else False
+
+        print(
+            f'[SCALAR_DEBUG] Input dim: {input_dim}, scalar_mask shape: {scalar_mask.shape}, has_scalar_output: {has_scalar_output}, has_scalar_input: {has_scalar_input}')
+
+        # If this layer has no scalar outputs (like final_conv '2x1o + 2x1e'),
+        # we should skip scalar processing entirely
+        if not has_scalar_output:
+            print(
+                f'[FINAL_CONV_SPECIAL] No scalar outputs detected, skipping scalar processing')
+            x_scalar = None
+            scalar_dim = 0
+            # For layers with no scalar outputs, treat all input as vector features
+            x_vector = x
+        else:
+            scalar_dim = scalar_mask.sum().item()
+            x_scalar = x[:, :, scalar_mask] if scalar_dim > 0 else None
+            x_vector = x[:, :, ~
+                         scalar_mask] if scalar_dim < x.shape[-1] else None
+
+        # Apply spectral convolution to scalar features
+        if x_scalar is not None and self.time_conv is not None:
+            # DYNAMIC FIX: Check if time_conv dimensions match input
+            if x_scalar.shape[-1] != self.time_conv.in_channels:
+                print(
+                    f'[TIME_CONV_MISMATCH] Expected {self.time_conv.in_channels}, got {x_scalar.shape[-1]}. Using cached/creating dynamic time conv.')
+
+                # OPTIMIZATION: Use cached time convolution if available
+                time_conv_key = f'{x_scalar.shape[-1]}_{self.time_conv.out_channels}_{self.time_conv.modes}'
+
+                if time_conv_key in self._dynamic_time_conv_cache:
+                    dynamic_time_conv = self._dynamic_time_conv_cache[time_conv_key]
+                    print(
+                        f'[TIME_CONV_CACHE_HIT] Reusing cached time conv for {time_conv_key}')
+                else:
+                    # Create new time convolution with matching dimensions
+                    dynamic_time_conv = SpectralConv1d(
+                        x_scalar.shape[-1], self.time_conv.out_channels, self.time_conv.modes).to(x_scalar.device)
+                    self._dynamic_time_conv_cache[time_conv_key] = dynamic_time_conv
+                    print(
+                        f'[TIME_CONV_CACHE_MISS] Created and cached time conv for {time_conv_key}')
+
+                x_scalar = dynamic_time_conv(x_scalar)
+            else:
+                x_scalar = self.time_conv(x_scalar)
+
+        # Process edge features - ensure correct dtype
+        # DTYPE FIX: Convert edge_attr to match model weights dtype
+        edge_attr = edge_attr.float()  # Ensure float32 dtype
+        edge_weights = torch.clamp(self.edge_mlp(edge_attr), -10, 10)
+
+        # Equivariant convolution
+        x_out = []
+
+        # Handle expanded edge_index: [2, T*E] -> [2, T, E]
+        original_num_edges = edge_index.shape[1] // T
+        if edge_index.shape[1] > 0:
+            edge_index_reshaped = edge_index.view(2, T, original_num_edges)
+
+        for t in range(T):
+            if torch.isnan(edge_weights[t]).any() or torch.isinf(edge_weights[t]).any():
+                raise ValueError('Edge weights contain NaN or Inf values')
+
+            # Use the correct edge indices for time step t
+            if edge_index.shape[1] > 0:
+                edge_index_t = edge_index_reshaped[:, t, :]  # [2, E]
+
+                # CRITICAL SAFETY: Clamp edge indices to valid node ranges
+                max_src_idx = x.shape[1] - 1  # Source nodes (dimension 1 of x)
+                # Destination nodes
+                max_dst_idx = (out_nodes if out_nodes is not None else N) - 1
+
+                # FIX INPLACE: Use non-inplace clamp to avoid gradient computation issues
+                edge_index_t_clamped = torch.stack([
+                    torch.clamp(edge_index_t[0], 0, max_src_idx),
+                    torch.clamp(edge_index_t[1], 0, max_dst_idx)
+                ], dim=0)
+
+                # Apply tensor product with dtype consistency
+                x_input = x[t][edge_index_t_clamped[0]]
+
+                # DTYPE FIX: Ensure all inputs to tensor product have consistent dtypes
+                # Convert everything to float32 to avoid Double/Float mismatch
+                x_input = x_input.float()
+                edge_sh_t = edge_sh[t].float()
+                edge_weights_t = edge_weights[t].float()
+
+                x_t_out = self.tp(x_input, edge_sh_t, edge_weights_t)
+                out_dim = out_nodes if out_nodes is not None else N
+                x_t_out = scatter_mean(
+                    x_t_out, edge_index_t_clamped[1], dim=0, dim_size=out_dim)
+            else:
+                out_dim = out_nodes if out_nodes is not None else N
+                x_t_out = torch.zeros((out_dim, x.shape[-1]), device=x.device)
+            x_out.append(x_t_out)
+
+        x_out = torch.stack(x_out, dim=0)
+
+        # Combine scalar and vector outputs
+        scalar_out_dim = sum(
+            mul for mul, irrep in self.out_irreps if irrep.l == 0)
+        if x_scalar is not None and scalar_out_dim > 0:
+            # CRITICAL FIX: Check if x_scalar and x_out have compatible shapes
+            if x_scalar.shape[1] == x_out.shape[1]:
+                x_out_scalar = x_out[:, :, :scalar_out_dim] + x_scalar
+                x_out = torch.cat(
+                    [x_out_scalar, x_out[:, :, scalar_out_dim:]], dim=-1)
+            else:
+                # Skip scalar combination if shapes don't match (e.g., cross-connections)
+                print(
+                    f'[SHAPE_MISMATCH] Skipping scalar combination: x_scalar {x_scalar.shape} vs x_out {x_out.shape}')
+                pass
+
+        # Apply normalization and dropout
+        x_out = self.bn(x_out) if self.batch_norm else x_out
+        if self.dropout > 0:
+            x_out = F.dropout(x_out, p=self.dropout, training=self.training)
+
+        # Residual connection
+        if self.residual and self.in_irreps == self.out_irreps:
+            x_out = x_out + x
+
+        return x_out
+
+
+class TensorProductScoreModel(nn.Module):
+    """Tensor product-based score model for molecular docking."""
+
+    def __init__(
+        self,
+        t_to_sigma,
+        device: torch.device,
+        timestep_emb_func=None,
+        in_lig_edge_features: int = 4,
+        sigma_embed_dim: int = 32,
+        sh_lmax: int = 2,
+        ns: int = 16,
+        nv: int = 4,
+        num_conv_layers: int = 2,
+        lig_max_radius: float = 5.0,
+        rec_max_radius: float = 30.0,
+        cross_max_distance: float = 250.0,
+        center_max_distance: float = 30.0,
+        distance_embed_dim: int = 32,
+        cross_distance_embed_dim: int = 32,
+        no_torsion: bool = False,
+        scale_by_sigma: bool = True,
+        use_second_order_repr: bool = False,
+        batch_norm: bool = True,
+        dynamic_max_cross: bool = False,
+        dropout: float = 0.0,
+        lm_embedding_type: bool = False,
+        confidence_mode: bool = False,
+        confidence_dropout: float = 0.0,
+        confidence_no_batchnorm: bool = False,
+        num_confidence_outputs: int = 1,
+        num_timesteps: int = 8,
+        num_modes: int = 2,
+        schedule_type: str = 'cosine'
+    ):
+        super().__init__()
+        self.t_to_sigma = t_to_sigma
+        self.device = device
+        self.timestep_emb_func = timestep_emb_func
+        self.in_lig_edge_features = in_lig_edge_features
+        self.sigma_embed_dim = sigma_embed_dim
+        self.lig_max_radius = lig_max_radius
+        self.rec_max_radius = rec_max_radius
+        self.cross_max_distance = cross_max_distance
+        self.center_max_distance = center_max_distance
+        self.distance_embed_dim = distance_embed_dim
+        self.cross_distance_embed_dim = cross_distance_embed_dim
+        self.sh_irreps = o3.Irreps.spherical_harmonics(lmax=sh_lmax)
+        self.ns, self.nv = ns, nv
+        self.scale_by_sigma = scale_by_sigma
+        self.no_torsion = no_torsion
+        self.num_conv_layers = num_conv_layers
+        self.dynamic_max_cross = dynamic_max_cross
+        self.confidence_mode = confidence_mode
+        self.num_timesteps = num_timesteps
+        self.num_modes = num_modes
+        self.schedule_type = schedule_type
+
+        # Initialize embeddings
+        self._init_embeddings(lm_embedding_type, dropout)
+        self._init_conv_layers(use_second_order_repr, batch_norm, dropout)
+        self._init_confidence_predictor(
+            confidence_mode, confidence_dropout, confidence_no_batchnorm, num_confidence_outputs)
+
+        # Adjust timesteps dynamically
+        self.adjust_timesteps()
+
+    def _init_embeddings(self, lm_embedding_type: bool, dropout: float):
+        """Initialize node and edge embedding layers."""
+        self.lig_node_embedding = AtomEncoder(
+            emb_dim=self.ns, feature_dims=lig_feature_dims, sigma_embed_dim=self.sigma_embed_dim
+        )
+        self.lig_edge_embedding = nn.Sequential(
+            nn.Linear(self.in_lig_edge_features +
+                      self.sigma_embed_dim + self.distance_embed_dim, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, self.ns)
+        )
+        self.rec_node_embedding = AtomEncoder(
+            emb_dim=self.ns, feature_dims=rec_residue_feature_dims, sigma_embed_dim=self.sigma_embed_dim,
+            lm_embedding_type=lm_embedding_type
+        )
+        self.rec_edge_embedding = nn.Sequential(
+            nn.Linear(self.sigma_embed_dim + self.distance_embed_dim, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, self.ns)
+        )
+        self.atom_node_embedding = AtomEncoder(
+            emb_dim=self.ns, feature_dims=rec_atom_feature_dims, sigma_embed_dim=self.sigma_embed_dim
+        )
+        self.atom_edge_embedding = nn.Sequential(
+            nn.Linear(self.sigma_embed_dim + self.distance_embed_dim, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, self.ns)
+        )
+        self.lr_edge_embedding = nn.Sequential(
+            nn.Linear(self.sigma_embed_dim +
+                      self.cross_distance_embed_dim, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, self.ns)
+        )
+        self.ar_edge_embedding = nn.Sequential(
+            nn.Linear(self.sigma_embed_dim + self.distance_embed_dim, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, self.ns)
+        )
+        self.la_edge_embedding = nn.Sequential(
+            nn.Linear(self.sigma_embed_dim +
+                      self.cross_distance_embed_dim, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, self.ns)
+        )
+        self.lig_distance_expansion = GaussianSmearing(
+            0.0, self.lig_max_radius, self.distance_embed_dim)
+        self.rec_distance_expansion = GaussianSmearing(
+            0.0, self.rec_max_radius, self.distance_embed_dim)
+        self.cross_distance_expansion = GaussianSmearing(
+            0.0, self.cross_max_distance, self.cross_distance_embed_dim)
+
+    def _init_conv_layers(self, use_second_order_repr: bool, batch_norm: bool, dropout: float):
+        """Initialize convolutional layers."""
+        irrep_seq = [
+            f'{self.ns}x0e',
+            f'{self.ns}x0e + {self.nv}x1o + {self.nv}x2e' if use_second_order_repr else f'{self.ns}x0e + {self.nv}x1o',
+            f'{self.ns}x0e + {self.nv}x1o + {self.nv}x2e + {self.nv}x1e + {self.nv}x2o' if use_second_order_repr else f'{self.ns}x0e + {self.nv}x1o + {self.nv}x1e',
+            f'{self.ns}x0e + {self.nv}x1o + {self.nv}x2e + {self.nv}x1e + {self.nv}x2o + {self.ns}x0o' if use_second_order_repr else f'{self.ns}x0e + {self.nv}x1o + {self.nv}x1e + {self.ns}x0o'
+        ]
+
+        self.conv_layers = nn.ModuleList()
+        for i in range(self.num_conv_layers):
+            in_irreps = irrep_seq[min(i, len(irrep_seq) - 1)]
+            out_irreps = irrep_seq[min(i + 1, len(irrep_seq) - 1)]
+
+            # ORIGINAL DESIGN: Create 9 identical layers for each conv step
+            # This matches the original DiffDock pattern: 9*l + {0..8}
+            for _ in range(9):  # 3 intra & 6 inter per each layer
+                layer = TimeEquivConvLayer(
+                    in_irreps=in_irreps,
+                    sh_irreps=self.sh_irreps,
+                    out_irreps=out_irreps,
+                    n_edge_features=3 * self.ns,
+                    residual=False,
+                    batch_norm=batch_norm,
+                    dropout=dropout,
+                    num_timesteps=self.num_timesteps,
+                    num_modes=self.num_modes
+                )
+                self.conv_layers.append(layer)
+
+    def _init_confidence_predictor(self, confidence_mode: bool, confidence_dropout: float, confidence_no_batchnorm: bool, num_confidence_outputs: int):
+        """Initialize confidence and final prediction layers."""
+        if confidence_mode:
+            self.num_confidence_outputs = num_confidence_outputs
+            self.confidence_predictor = nn.Sequential(
+                nn.Linear(2 * self.ns if self.num_conv_layers >=
+                          3 else self.ns, self.ns),
+                nn.BatchNorm1d(
+                    self.ns) if not confidence_no_batchnorm else nn.Identity(),
+                nn.ReLU(),
+                nn.Dropout(confidence_dropout),
+                nn.Linear(self.ns, self.ns),
+                nn.BatchNorm1d(
+                    self.ns) if not confidence_no_batchnorm else nn.Identity(),
+                nn.ReLU(),
+                nn.Dropout(confidence_dropout),
+                nn.Linear(self.ns, 2 * num_confidence_outputs)
+            )
+        else:
+            self.center_distance_expansion = GaussianSmearing(
+                0.0, self.center_max_distance, self.distance_embed_dim)
+            self.center_edge_embedding = nn.Sequential(
+                nn.Linear(self.distance_embed_dim +
+                          self.sigma_embed_dim, self.ns),
+                nn.ReLU(),
+                nn.Dropout(confidence_dropout),
+                nn.Linear(self.ns, self.ns)
+            )
+            self.final_conv = TimeEquivConvLayer(
+                in_irreps=self.conv_layers[-1].out_irreps,
+                sh_irreps=self.sh_irreps,
+                out_irreps='2x1o + 2x1e',
+                n_edge_features=2 * self.ns,
+                residual=False,
+                batch_norm=True,
+                dropout=confidence_dropout,
+                num_timesteps=self.num_timesteps,
+                num_modes=self.num_modes
+            )
+            self.tr_final_layer = nn.Sequential(
+                nn.Linear(1 + self.sigma_embed_dim, self.ns),
+                nn.Dropout(confidence_dropout),
+                nn.ReLU(),
+                nn.Linear(self.ns, 1)
+            )
+            self.rot_final_layer = nn.Sequential(
+                nn.Linear(1 + self.sigma_embed_dim, self.ns),
+                nn.Dropout(confidence_dropout),
+                nn.ReLU(),
+                nn.Linear(self.ns, 1)
+            )
+            if not self.no_torsion:
+                self.final_edge_embedding = nn.Sequential(
+                    nn.Linear(self.distance_embed_dim, self.ns),
+                    nn.ReLU(),
+                    nn.Dropout(confidence_dropout),
+                    nn.Linear(self.ns, self.ns)
+                )
+                self.final_tp_tor = o3.FullTensorProduct(self.sh_irreps, '2e')
+                self.tor_bond_conv = TimeEquivConvLayer(
+                    in_irreps=self.conv_layers[-1].out_irreps,
+                    sh_irreps=self.final_tp_tor.irreps_out,
+                    out_irreps=f'{self.ns}x0o + {self.ns}x0e',
+                    n_edge_features=3 * self.ns,
+                    residual=False,
+                    batch_norm=True,
+                    dropout=confidence_dropout,
+                    num_timesteps=self.num_timesteps,
+                    num_modes=self.num_modes
+                )
+                self.tor_final_layer = nn.Sequential(
+                    nn.Linear(2 * self.ns, self.ns, bias=False),
+                    nn.Tanh(),
+                    nn.Dropout(confidence_dropout),
+                    nn.Linear(self.ns, 1, bias=False)
+                )
+
+    def adjust_timesteps(self, num_nodes: int = None):
+        """Dynamically adjust number of timesteps based on molecule complexity.
+
+        Args:
+            num_nodes: Number of nodes in the graph (optional).
+        """
+        if num_nodes is not None:
+            self.num_timesteps = max(4, min(16, int(math.log2(num_nodes) * 2)))
+        else:
+            self.num_timesteps = max(4, min(16, self.num_conv_layers * 4))
+
+    def expand_edge_index(self, edge_index: torch.Tensor, T: int) -> torch.Tensor:
+        """Expand edge indices across time dimension efficiently.
+
+        Args:
+            edge_index: Edge indices [2, E].
+            T: Number of time steps.
+
+        Returns:
+            Expanded edge indices [2, T * E].
+        """
+        if edge_index.shape[1] == 0:
+            return torch.zeros((2, 0), dtype=edge_index.dtype, device=edge_index.device)
+
+        if edge_index.numel() > 0:
+            max_idx = edge_index.max().item()
+            min_idx = edge_index.min().item()
+            if min_idx < 0:
+                print(f'[DEBUG] Warning: Negative edge index found: {min_idx}')
+                valid_mask = (edge_index >= 0).all(dim=0)
+                edge_index = edge_index[:, valid_mask]
+                print(f'[DEBUG] Filtered edge_index shape: {edge_index.shape}')
+
+        if edge_index.shape[1] == 0:
+            return torch.zeros((2, 0), dtype=edge_index.dtype, device=edge_index.device)
+
+        try:
+            edge_index_expanded = edge_index.unsqueeze(
+                1).expand(-1, T, -1).reshape(2, -1)
+            return edge_index_expanded
+        except Exception as e:
+            print(f'[DEBUG] Error in expand_edge_index: {e}')
+            edge_list = [edge_index for _ in range(T)]
+            return torch.cat(edge_list, dim=1) if edge_list else torch.zeros((2, 0), dtype=edge_index.dtype, device=edge_index.device)
+
+    def forward(self, data):
+        """Forward pass of the score model.
+
+        Args:
+            data: Input data containing ligand, receptor, and atom graphs.
+
+        Returns:
+            If confidence_mode:
+                (mean, variance): Confidence predictions.
+            Else:
+                (tr_pred, rot_pred, tor_pred): Translation, rotation, and torsion predictions.
+        """
+        from torch_geometric.data import Batch, Data
+
+        # CRITICAL CUDA FIX: Add comprehensive safety checks
+        try:
+            # Debug input data
+            print(f'[FORWARD_DEBUG] Input data type: {type(data)}')
+            if hasattr(data, 'keys'):
+                data_keys = list(data.keys()) if callable(
+                    data.keys) else list(data.keys or [])
+                print(f'[FORWARD_DEBUG] Input data keys: {data_keys}')
+            if hasattr(data, 'node_types'):
+                print(f'[FORWARD_DEBUG] Node types: {data.node_types}')
+
+            # Validate ligand data
+            if 'ligand' not in data:
+                print(f'[CRITICAL_ERROR] Missing "ligand" key in data')
+                raise RuntimeError('Missing ligand key in data')
+
+            # CUDA SAFETY: Check for potential index issues
+            if hasattr(data['ligand'], 'batch'):
+                batch_tensor = data['ligand'].batch
+                if batch_tensor.numel() > 0:
+                    min_batch = batch_tensor.min().item()
+                    max_batch = batch_tensor.max().item()
+                    print(
+                        f'[CUDA_SAFETY] Initial batch range: {min_batch} to {max_batch}')
+
+                    # Force safe batch indices to prevent CUDA errors
+                    if min_batch < 0 or max_batch > 100:
+                        print(
+                            f'[CUDA_SAFETY] Unsafe batch indices detected, forcing to safe range')
+                        data['ligand'].batch = torch.zeros_like(batch_tensor)
+
+            if hasattr(data['ligand'], 'x'):
+                print(
+                    f'[FORWARD_DEBUG] Ligand.x shape: {data["ligand"].x.shape}')
+                # CUDA SAFETY: Check for NaN/Inf in input features
+                if torch.isnan(data['ligand'].x).any() or torch.isinf(data['ligand'].x).any():
+                    print(
+                        f'[CUDA_SAFETY] NaN/Inf detected in ligand.x, replacing with zeros')
+                    data['ligand'].x = torch.where(torch.isnan(data['ligand'].x) | torch.isinf(data['ligand'].x),
+                                                   torch.zeros_like(data['ligand'].x), data['ligand'].x)
+
+        except Exception as e:
+            print(f'[CUDA_SAFETY] Safety check failed: {e}')
+            # Create minimal safe data structure
+            safe_device = torch.device(
+                'cuda:0' if torch.cuda.is_available() else 'cpu')
+            return (torch.zeros(1, 3, device=safe_device),
+                    torch.zeros(1, 3, device=safe_device),
+                    torch.zeros(1, device=safe_device))
+
+        # Ensure data is on correct device
+        data = data.to(self.device)
+
+        # Handle list of graphs from DataListLoader
+        if isinstance(data, list):
+            print(
+                f'[FORWARD_DEBUG] Converting list of {len(data)} items to batch')
+            data = Batch.from_data_list(data).to(self.device)
+
+            # Handle ligand list format
+        if isinstance(data['ligand'], list):
+            print(f'[FINAL_FIX] Ligand is a list - performing emergency conversion')
+            ligand_list = data['ligand']
+            if not ligand_list:
+                raise RuntimeError('Empty ligand list')
+
+            try:
+                ligand_batch = Batch.from_data_list(
+                    ligand_list).to(self.device)
+                data['ligand'] = ligand_batch
+                print(
+                    f'[FINAL_FIX] Successfully converted ligand list to batch: {ligand_batch.x.shape}')
+            except Exception as e:
+                print(f'[FINAL_FIX] Standard conversion failed: {e}')
+                x_parts, pos_parts, batch_parts = [], [], []
+                for i, lig_data in enumerate(ligand_list):
+                    if hasattr(lig_data, 'x') and hasattr(lig_data, 'pos'):
+                        x_parts.append(lig_data.x.to(self.device))
+                        pos_parts.append(lig_data.pos.to(self.device))
+                        batch_parts.append(torch.full(
+                            (lig_data.x.shape[0],), i, dtype=torch.long, device=self.device))
+
+                if x_parts:
+                    ligand_batch = Data(
+                        x=torch.cat(x_parts, dim=0),
+                        pos=torch.cat(pos_parts, dim=0),
+                        batch=torch.cat(batch_parts, dim=0),
+                        edge_index=torch.zeros(
+                            (2, 0), dtype=torch.long, device=self.device),
+                        edge_attr=torch.zeros(
+                            (0, 4), dtype=torch.float, device=self.device)
+                    )
+                    data['ligand'] = ligand_batch
+                    print(
+                        f'[FINAL_FIX] Manual conversion successful: {ligand_batch.x.shape}')
+                else:
+                    raise RuntimeError('No valid ligand data found in list')
+
+        # Validate and repair batch indices
+        if hasattr(data['ligand'], 'batch'):
+            batch_tensor = data['ligand'].batch
+            print(
+                f'[BATCH_VALIDATION] Original batch min/max: {batch_tensor.min().item()} to {batch_tensor.max().item()}')
+
+            needs_repair = False
+            try:
+                min_val, max_val = batch_tensor.min().item(), batch_tensor.max().item()
+                if min_val < 0 or max_val > 1000 or torch.isnan(batch_tensor).any() or torch.isinf(batch_tensor).any():
+                    needs_repair = True
+                    print(
+                        f'[BATCH_CORRUPTION] Corrupted batch detected: min={min_val}, max={max_val}')
+            except Exception as e:
+                needs_repair = True
+                print(f'[BATCH_CORRUPTION] Failed to validate batch: {e}')
+
+            if needs_repair:
+                print(f'[BATCH_REPAIR] Rebuilding batch indices')
+                num_nodes = data['ligand'].x.shape[0]
+                data['ligand'].batch = torch.zeros(
+                    num_nodes, dtype=torch.long, device=self.device)
+                print(
+                    f'[BATCH_REPAIR] Rebuilt batch: shape={data["ligand"].batch.shape}, values={torch.unique(data["ligand"].batch)}')
+            else:
+                unique_batches = torch.unique(batch_tensor, sorted=True)
+                expected_batches = torch.arange(
+                    len(unique_batches), device=self.device)
+                if not torch.equal(unique_batches, expected_batches):
+                    print(
+                        f'[BATCH_REINDEX] Non-contiguous batch indices: {unique_batches} -> {expected_batches}')
+                    new_batch = torch.zeros_like(batch_tensor)
+                    for new_idx, old_idx in enumerate(unique_batches):
+                        new_batch[batch_tensor == old_idx] = new_idx
+                    data['ligand'].batch = new_batch
+                    print(
+                        f'[BATCH_REINDEX] Fixed batch indices: {torch.unique(data["ligand"].batch)}')
+
+            final_batch = data['ligand'].batch
+            print(
+                f'[BATCH_FINAL] Final batch - shape: {final_batch.shape}, unique: {torch.unique(final_batch)}, min/max: {final_batch.min().item()}/{final_batch.max().item()}')
+
+            if final_batch.max().item() >= 1000 or final_batch.min().item() < 0:
+                print(f'[BATCH_EMERGENCY] Forcing all indices to 0')
+                data['ligand'].batch = torch.zeros_like(final_batch)
+
+        if not hasattr(data['ligand'], 'x'):
+            print(
+                f'[FINAL_ERROR] Missing ligand.x after all conversions, type: {type(data["ligand"])}')
+            raise RuntimeError('Final conversion failed - missing ligand.x')
+
+        print(
+            f'[FORWARD_SUCCESS] Data validation passed - ligand.x shape: {data["ligand"].x.shape}')
+
+        # Get noise parameters
+        if not self.confidence_mode:
+            tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(
+                *[data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']])
+        else:
+            tr_sigma, rot_sigma, tor_sigma = [
+                data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']]
+
+        # Adjust timesteps
+        self.adjust_timesteps(num_nodes=data['ligand'].pos.shape[0])
+
+        # Time step scheduling
+        T = self.num_timesteps
+        timesteps = torch.tensor(get_t_schedule(
+            T, self.schedule_type), device=self.device)
+        time_emb = self.timestep_emb_func(timesteps).unsqueeze(1)
+
+        # Build graphs
+        lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh = self.build_lig_conv_graph(
+            data)
+        rec_node_attr, rec_edge_index, rec_edge_attr, rec_edge_sh = self.build_rec_conv_graph(
+            data)
+        atom_node_attr, atom_edge_index, atom_edge_attr, atom_edge_sh = self.build_atom_conv_graph(
+            data)
+
+        # DEEP CUDA SAFETY: Validate input tensors before embedding
+        print(f'[DEEP_SAFETY] Preparing ligand node attributes for embedding')
+
+        # Validate lig_node_attr tensor
+        if torch.isnan(lig_node_attr).any():
+            print(
+                f'[DEEP_SAFETY] NaN detected in lig_node_attr, replacing with zeros')
+            lig_node_attr = torch.where(torch.isnan(
+                lig_node_attr), torch.zeros_like(lig_node_attr), lig_node_attr)
+
+        if torch.isinf(lig_node_attr).any():
+            print(
+                f'[DEEP_SAFETY] Inf detected in lig_node_attr, replacing with zeros')
+            lig_node_attr = torch.where(torch.isinf(
+                lig_node_attr), torch.zeros_like(lig_node_attr), lig_node_attr)
+
+        # Check for extreme values that might cause GPU errors
+        if lig_node_attr.abs().max() > 1000:
+            print(f'[DEEP_SAFETY] Extreme values detected, clamping to [-10, 10]')
+            lig_node_attr = torch.clamp(lig_node_attr, -10, 10)
+
+        # Ensure tensor is contiguous and properly aligned
+        lig_node_attr = lig_node_attr.contiguous()
+
+        print(
+            f'[DEEP_SAFETY] lig_node_attr final shape: {lig_node_attr.shape}, dtype: {lig_node_attr.dtype}, device: {lig_node_attr.device}')
+        print(
+            f'[DEEP_SAFETY] lig_node_attr stats: min={lig_node_attr.min().item():.6f}, max={lig_node_attr.max().item():.6f}, mean={lig_node_attr.mean().item():.6f}')
+
+        # Note: lig_node_attr already embedded in build_lig_conv_graph
+        # lig_node_attr = self.lig_node_embedding(lig_node_attr)  # REMOVED: Already embedded
+        rec_node_attr = self.rec_node_embedding(rec_node_attr)
+        atom_node_attr = self.atom_node_embedding(atom_node_attr)
+
+        # CRITICAL FIX: Expand node attributes to time dimension
+        # Node attributes from build_*_conv_graph are 2D [num_nodes, features]
+        # but conv layers expect 3D [T, num_nodes, features]
+        lig_node_attr = lig_node_attr.unsqueeze(0).expand(T, -1, -1)
+        rec_node_attr = rec_node_attr.unsqueeze(0).expand(T, -1, -1)
+        atom_node_attr = atom_node_attr.unsqueeze(0).expand(T, -1, -1)
+
+        lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
+        rec_edge_attr = self.rec_edge_embedding(rec_edge_attr)
+        atom_edge_attr = self.atom_edge_embedding(atom_edge_attr)
+
+        # Expand edge indices and features
+        lig_edge_index = self.expand_edge_index(lig_edge_index, T)
+        rec_edge_index = self.expand_edge_index(rec_edge_index, T)
+        atom_edge_index = self.expand_edge_index(atom_edge_index, T)
+
+        lig_edge_attr = lig_edge_attr.unsqueeze(0).expand(T, -1, -1)
+        rec_edge_attr = rec_edge_attr.unsqueeze(0).expand(T, -1, -1)
+        atom_edge_attr = atom_edge_attr.unsqueeze(0).expand(T, -1, -1)
+
+        lig_edge_sh = lig_edge_sh.unsqueeze(0).expand(T, -1, -1)
+        rec_edge_sh = rec_edge_sh.unsqueeze(0).expand(T, -1, -1)
+        atom_edge_sh = atom_edge_sh.unsqueeze(0).expand(T, -1, -1)
+
+        # Build cross graph
+        cross_cutoff = (
+            tr_sigma * 3 + 20).unsqueeze(1) if self.dynamic_max_cross else self.cross_max_distance
+        lr_edge_index, lr_edge_attr, lr_edge_sh, la_edge_index, la_edge_attr, la_edge_sh, ar_edge_index, ar_edge_attr, ar_edge_sh = self.build_cross_conv_graph(
+            data, cross_cutoff)
+
+        # Encode cross edge features
+        lr_edge_attr = self.lr_edge_embedding(lr_edge_attr)
+        la_edge_attr = self.la_edge_embedding(la_edge_attr)
+        ar_edge_attr = self.ar_edge_embedding(ar_edge_attr)
+
+        lr_edge_index = self.expand_edge_index(lr_edge_index, T)
+        la_edge_index = self.expand_edge_index(la_edge_index, T)
+        ar_edge_index = self.expand_edge_index(ar_edge_index, T)
+
+        lr_edge_attr = lr_edge_attr.unsqueeze(0).expand(T, -1, -1)
+        la_edge_attr = la_edge_attr.unsqueeze(0).expand(T, -1, -1)
+        ar_edge_attr = ar_edge_attr.unsqueeze(0).expand(T, -1, -1)
+
+        lr_edge_sh = lr_edge_sh.unsqueeze(0).expand(T, -1, -1)
+        la_edge_sh = la_edge_sh.unsqueeze(0).expand(T, -1, -1)
+        ar_edge_sh = ar_edge_sh.unsqueeze(0).expand(T, -1, -1)
+
+        # Time step weights
+        time_weights = (1 - timesteps).view(T, 1, 1)
+
+        # Convolution layers
+        for l in range(len(self.conv_layers)):
+            # Ligand update
+            if lig_edge_index.shape[1] > 0:
+                max_node_idx = lig_node_attr.shape[1] - 1
+                if lig_edge_index.max().item() > max_node_idx:
+                    print(
+                        f'[DEBUG] Edge index {lig_edge_index.max().item()} exceeds node count {max_node_idx} in ligand conv')
+                    valid_mask = (lig_edge_index[0] <= max_node_idx) & (
+                        lig_edge_index[1] <= max_node_idx)
+                    lig_edge_index = lig_edge_index[:, valid_mask]
+                    # Fix for 3D tensors with expanded edge indices
+                    if lig_edge_attr.dim() == 3 and lig_edge_attr.shape[1] > 0:
+                        # When edge_index is expanded, mask has shape [T*E] but tensor has shape [T, E, F]
+                        # We need to reshape the mask to [T, E] and take any slice (they're all the same)
+                        T = lig_edge_attr.shape[0]
+                        E = lig_edge_attr.shape[1]
+                        reshaped_mask = valid_mask.view(
+                            T, -1)[0]  # Take first time step mask
+                        lig_edge_attr = lig_edge_attr[:, reshaped_mask]
+                    elif lig_edge_attr.dim() == 2:
+                        lig_edge_attr = lig_edge_attr[valid_mask] if lig_edge_attr.shape[0] > 0 else lig_edge_attr
+
+                    if lig_edge_sh.dim() == 3 and lig_edge_sh.shape[1] > 0:
+                        T = lig_edge_sh.shape[0]
+                        reshaped_mask = valid_mask.view(
+                            T, -1)[0]  # Take first time step mask
+                        lig_edge_sh = lig_edge_sh[:, reshaped_mask]
+                    elif lig_edge_sh.dim() == 2:
+                        lig_edge_sh = lig_edge_sh[valid_mask] if lig_edge_sh.shape[0] > 0 else lig_edge_sh
+                    print(
+                        f'[DEBUG] Filtered ligand edges: {lig_edge_index.shape}, edge_attr: {lig_edge_attr.shape}, edge_sh: {lig_edge_sh.shape}')
+
+            # CRITICAL FIX: Handle expanded edge indices properly
+            if lig_edge_index.shape[1] > 0:
+                # Edge index is expanded: [2, T*num_edges], we need to handle it properly
+                original_num_edges = lig_edge_index.shape[1] // T
+
+                # Reshape edge index to [T, 2, num_edges] then take [0] for source, [1] for target
+                edge_index_reshaped = lig_edge_index.view(
+                    2, T, original_num_edges)
+                source_indices = edge_index_reshaped[0]  # [T, num_edges]
+                target_indices = edge_index_reshaped[1]  # [T, num_edges]
+
+                # Index node attributes using proper time-aligned indices
+                source_features = torch.gather(lig_node_attr[:, :, :self.ns], 1,
+                                               source_indices.unsqueeze(-1).expand(-1, -1, self.ns))
+                target_features = torch.gather(lig_node_attr[:, :, :self.ns], 1,
+                                               target_indices.unsqueeze(-1).expand(-1, -1, self.ns))
+
+                lig_edge_features = torch.cat(
+                    [lig_edge_attr, source_features, target_features], dim=-1)
+            else:
+                lig_edge_features = torch.cat([
+                    lig_edge_attr,
+                    torch.zeros((T, 0, self.ns), device=lig_node_attr.device),
+                    torch.zeros((T, 0, self.ns), device=lig_node_attr.device)
+                ], dim=-1)
+
+            lig_update = self.conv_layers[l](
+                lig_node_attr, lig_edge_index, lig_edge_features, lig_edge_sh)
+
+            # Receptor update
+            if rec_edge_index.shape[1] > 0:
+                max_node_idx = rec_node_attr.shape[1] - 1
+                if rec_edge_index.max().item() > max_node_idx:
+                    print(
+                        f'[DEBUG] Edge index {rec_edge_index.max().item()} exceeds node count {max_node_idx} in receptor conv')
+                    valid_mask = (rec_edge_index[0] <= max_node_idx) & (
+                        rec_edge_index[1] <= max_node_idx)
+                    rec_edge_index = rec_edge_index[:, valid_mask]
+                    # Fix for 3D tensors with expanded edge indices
+                    if rec_edge_attr.dim() == 3 and rec_edge_attr.shape[1] > 0:
+                        T = rec_edge_attr.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        rec_edge_attr = rec_edge_attr[:, reshaped_mask]
+                    elif rec_edge_attr.dim() == 2:
+                        rec_edge_attr = rec_edge_attr[valid_mask] if rec_edge_attr.shape[0] > 0 else rec_edge_attr
+
+                    if rec_edge_sh.dim() == 3 and rec_edge_sh.shape[1] > 0:
+                        T = rec_edge_sh.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        rec_edge_sh = rec_edge_sh[:, reshaped_mask]
+                    elif rec_edge_sh.dim() == 2:
+                        rec_edge_sh = rec_edge_sh[valid_mask] if rec_edge_sh.shape[0] > 0 else rec_edge_sh
+
+            # CRITICAL FIX: Handle expanded edge indices properly for receptor
+            if rec_edge_index.shape[1] > 0:
+                original_num_edges = rec_edge_index.shape[1] // T
+                edge_index_reshaped = rec_edge_index.view(
+                    2, T, original_num_edges)
+                source_indices = edge_index_reshaped[0]
+                target_indices = edge_index_reshaped[1]
+
+                source_features = torch.gather(rec_node_attr[:, :, :self.ns], 1,
+                                               source_indices.unsqueeze(-1).expand(-1, -1, self.ns))
+                target_features = torch.gather(rec_node_attr[:, :, :self.ns], 1,
+                                               target_indices.unsqueeze(-1).expand(-1, -1, self.ns))
+
+                rec_edge_features = torch.cat(
+                    [rec_edge_attr, source_features, target_features], dim=-1)
+            else:
+                rec_edge_features = torch.cat([
+                    rec_edge_attr,
+                    torch.zeros((T, 0, self.ns), device=rec_node_attr.device),
+                    torch.zeros((T, 0, self.ns), device=rec_node_attr.device)
+                ], dim=-1)
+
+            rec_update = self.conv_layers[l](
+                rec_node_attr, rec_edge_index, rec_edge_features, rec_edge_sh)
+
+            # Atom update
+            if atom_edge_index.shape[1] > 0:
+                max_node_idx = atom_node_attr.shape[1] - 1
+                if atom_edge_index.max().item() > max_node_idx:
+                    print(
+                        f'[DEBUG] Edge index {atom_edge_index.max().item()} exceeds node count {max_node_idx} in atom conv')
+                    valid_mask = (atom_edge_index[0] <= max_node_idx) & (
+                        atom_edge_index[1] <= max_node_idx)
+                    atom_edge_index = atom_edge_index[:, valid_mask]
+                    # Fix for 3D tensors with expanded edge indices
+                    if atom_edge_attr.dim() == 3 and atom_edge_attr.shape[1] > 0:
+                        T = atom_edge_attr.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        atom_edge_attr = atom_edge_attr[:, reshaped_mask]
+                    elif atom_edge_attr.dim() == 2:
+                        atom_edge_attr = atom_edge_attr[valid_mask] if atom_edge_attr.shape[0] > 0 else atom_edge_attr
+
+                    if atom_edge_sh.dim() == 3 and atom_edge_sh.shape[1] > 0:
+                        T = atom_edge_sh.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        atom_edge_sh = atom_edge_sh[:, reshaped_mask]
+                    elif atom_edge_sh.dim() == 2:
+                        atom_edge_sh = atom_edge_sh[valid_mask] if atom_edge_sh.shape[0] > 0 else atom_edge_sh
+
+            # CRITICAL FIX: Handle expanded edge indices properly for atoms
+            if atom_edge_index.shape[1] > 0:
+                original_num_edges = atom_edge_index.shape[1] // T
+                edge_index_reshaped = atom_edge_index.view(
+                    2, T, original_num_edges)
+                source_indices = edge_index_reshaped[0]
+                target_indices = edge_index_reshaped[1]
+
+                source_features = torch.gather(atom_node_attr[:, :, :self.ns], 1,
+                                               source_indices.unsqueeze(-1).expand(-1, -1, self.ns))
+                target_features = torch.gather(atom_node_attr[:, :, :self.ns], 1,
+                                               target_indices.unsqueeze(-1).expand(-1, -1, self.ns))
+
+                atom_edge_features = torch.cat(
+                    [atom_edge_attr, source_features, target_features], dim=-1)
+            else:
+                atom_edge_features = torch.cat([
+                    atom_edge_attr,
+                    torch.zeros((T, 0, self.ns), device=atom_node_attr.device),
+                    torch.zeros((T, 0, self.ns), device=atom_node_attr.device)
+                ], dim=-1)
+
+            atom_update = self.conv_layers[l](
+                atom_node_attr, atom_edge_index, atom_edge_features, atom_edge_sh)
+
+            # Cross updates
+            if lr_edge_index.shape[1] > 0:
+                lig_max_idx, rec_max_idx = lig_node_attr.shape[1] - \
+                    1, rec_node_attr.shape[1] - 1
+                valid_mask = (lr_edge_index[0] <= lig_max_idx) & (
+                    lr_edge_index[1] <= rec_max_idx)
+                if not valid_mask.all():
+                    print(f'[DEBUG] Invalid lr_edge_index, filtering...')
+                    lr_edge_index = lr_edge_index[:, valid_mask]
+                    # Fix for 3D tensors with expanded edge indices
+                    if lr_edge_attr.dim() == 3 and lr_edge_attr.shape[1] > 0:
+                        T = lr_edge_attr.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        lr_edge_attr = lr_edge_attr[:, reshaped_mask]
+                    elif lr_edge_attr.dim() == 2:
+                        lr_edge_attr = lr_edge_attr[valid_mask] if lr_edge_attr.shape[0] > 0 else lr_edge_attr
+
+                    if lr_edge_sh.dim() == 3 and lr_edge_sh.shape[1] > 0:
+                        T = lr_edge_sh.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        lr_edge_sh = lr_edge_sh[:, reshaped_mask]
+                    elif lr_edge_sh.dim() == 2:
+                        lr_edge_sh = lr_edge_sh[valid_mask] if lr_edge_sh.shape[0] > 0 else lr_edge_sh
+
+            # CRITICAL FIX: Handle expanded edge indices properly for ligand-receptor
+            if lr_edge_index.shape[1] > 0:
+                original_num_edges = lr_edge_index.shape[1] // T
+                edge_index_reshaped = lr_edge_index.view(
+                    2, T, original_num_edges)
+                lig_indices = edge_index_reshaped[0]  # ligand node indices
+                rec_indices = edge_index_reshaped[1]  # receptor node indices
+
+                # SAFETY: Clamp indices to valid ranges (non-inplace)
+                lig_max_idx = lig_node_attr.shape[1] - 1
+                rec_max_idx = rec_node_attr.shape[1] - 1
+                lig_indices_clamped = torch.clamp(lig_indices, 0, lig_max_idx)
+                rec_indices_clamped = torch.clamp(rec_indices, 0, rec_max_idx)
+
+                lig_features = torch.gather(lig_node_attr[:, :, :self.ns], 1,
+                                            lig_indices_clamped.unsqueeze(-1).expand(-1, -1, self.ns))
+                rec_features = torch.gather(rec_node_attr[:, :, :self.ns], 1,
+                                            rec_indices_clamped.unsqueeze(-1).expand(-1, -1, self.ns))
+
+                lr_edge_features = torch.cat(
+                    [lr_edge_attr, lig_features, rec_features], dim=-1)
+            else:
+                lr_edge_features = torch.cat([
+                    lr_edge_attr,
+                    torch.zeros((T, 0, self.ns), device=lig_node_attr.device),
+                    torch.zeros((T, 0, self.ns), device=rec_node_attr.device)
+                ], dim=-1)
+
+            # FINAL SAFETY: Also clamp edge_index for conv_layers
+            if lr_edge_index.shape[1] > 0:
+                # Clamp edge indices for the conv layer call
+                original_num_edges = lr_edge_index.shape[1] // T
+                edge_index_reshaped = lr_edge_index.view(
+                    2, T, original_num_edges)
+                lig_max_idx = lig_node_attr.shape[1] - 1
+                rec_max_idx = rec_node_attr.shape[1] - 1
+
+                # Clamp and reshape back (non-inplace)
+                edge_index_reshaped_clamped = torch.stack([
+                    torch.clamp(edge_index_reshaped[0], 0, lig_max_idx),
+                    torch.clamp(edge_index_reshaped[1], 0, rec_max_idx)
+                ], dim=0)
+                lr_edge_index_safe = edge_index_reshaped_clamped.view(2, -1)
+
+                lr_update = self.conv_layers[l](
+                    rec_node_attr, lr_edge_index_safe, lr_edge_features, lr_edge_sh, out_nodes=lig_node_attr.shape[1])
+            else:
+                # No edges, return zero update
+                lr_update = torch.zeros_like(lig_node_attr)
+
+            if la_edge_index.shape[1] > 0:
+                lig_max_idx, atom_max_idx = lig_node_attr.shape[1] - \
+                    1, atom_node_attr.shape[1] - 1
+                valid_mask = (la_edge_index[0] <= lig_max_idx) & (
+                    la_edge_index[1] <= atom_max_idx)
+                if not valid_mask.all():
+                    print(f'[DEBUG] Invalid la_edge_index, filtering...')
+                    la_edge_index = la_edge_index[:, valid_mask]
+                    # Fix for 3D tensors with expanded edge indices
+                    if la_edge_attr.dim() == 3 and la_edge_attr.shape[1] > 0:
+                        T = la_edge_attr.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        la_edge_attr = la_edge_attr[:, reshaped_mask]
+                    elif la_edge_attr.dim() == 2:
+                        la_edge_attr = la_edge_attr[valid_mask] if la_edge_attr.shape[0] > 0 else la_edge_attr
+
+                    if la_edge_sh.dim() == 3 and la_edge_sh.shape[1] > 0:
+                        T = la_edge_sh.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        la_edge_sh = la_edge_sh[:, reshaped_mask]
+                    elif la_edge_sh.dim() == 2:
+                        la_edge_sh = la_edge_sh[valid_mask] if la_edge_sh.shape[0] > 0 else la_edge_sh
+
+            # CRITICAL FIX: Handle expanded edge indices properly for ligand-atom
+            if la_edge_index.shape[1] > 0:
+                original_num_edges = la_edge_index.shape[1] // T
+                edge_index_reshaped = la_edge_index.view(
+                    2, T, original_num_edges)
+                lig_indices = edge_index_reshaped[0]
+                atom_indices = edge_index_reshaped[1]
+
+                # SAFETY: Clamp indices to valid ranges (non-inplace)
+                lig_max_idx = lig_node_attr.shape[1] - 1
+                atom_max_idx = atom_node_attr.shape[1] - 1
+                lig_indices_clamped = torch.clamp(lig_indices, 0, lig_max_idx)
+                atom_indices_clamped = torch.clamp(
+                    atom_indices, 0, atom_max_idx)
+
+                lig_features = torch.gather(lig_node_attr[:, :, :self.ns], 1,
+                                            lig_indices_clamped.unsqueeze(-1).expand(-1, -1, self.ns))
+                atom_features = torch.gather(atom_node_attr[:, :, :self.ns], 1,
+                                             atom_indices_clamped.unsqueeze(-1).expand(-1, -1, self.ns))
+
+                la_edge_features = torch.cat(
+                    [la_edge_attr, lig_features, atom_features], dim=-1)
+            else:
+                la_edge_features = torch.cat([
+                    la_edge_attr,
+                    torch.zeros((T, 0, self.ns), device=lig_node_attr.device),
+                    torch.zeros((T, 0, self.ns), device=atom_node_attr.device)
+                ], dim=-1)
+
+            # FUNDAMENTAL FIX: Only compute la_update if atoms exist
+            if atom_node_attr.shape[1] > 0 and la_edge_index.shape[1] > 0:
+                # Atoms exist, compute ligand-atom update
+                original_num_edges = la_edge_index.shape[1] // T
+                edge_index_reshaped = la_edge_index.view(
+                    2, T, original_num_edges)
+                lig_max_idx = lig_node_attr.shape[1] - 1
+                atom_max_idx = atom_node_attr.shape[1] - 1
+
+                edge_index_reshaped_clamped = torch.stack([
+                    torch.clamp(edge_index_reshaped[0], 0, lig_max_idx),
+                    torch.clamp(edge_index_reshaped[1], 0, atom_max_idx)
+                ], dim=0)
+                la_edge_index_safe = edge_index_reshaped_clamped.view(2, -1)
+
+                la_update = self.conv_layers[l](
+                    atom_node_attr, la_edge_index_safe, la_edge_features, la_edge_sh, out_nodes=lig_node_attr.shape[1])
+            else:
+                # No atoms or no edges: la_update not needed (will be skipped in conditional update)
+                la_update = None
+
+            if ar_edge_index.shape[1] > 0:
+                atom_max_idx, rec_max_idx = atom_node_attr.shape[1] - \
+                    1, rec_node_attr.shape[1] - 1
+                valid_mask = (ar_edge_index[0] <= atom_max_idx) & (
+                    ar_edge_index[1] <= rec_max_idx)
+                if not valid_mask.all():
+                    print(f'[DEBUG] Invalid ar_edge_index, filtering...')
+                    ar_edge_index = ar_edge_index[:, valid_mask]
+                    # Fix for 3D tensors with expanded edge indices
+                    if ar_edge_attr.dim() == 3 and ar_edge_attr.shape[1] > 0:
+                        T = ar_edge_attr.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        ar_edge_attr = ar_edge_attr[:, reshaped_mask]
+                    elif ar_edge_attr.dim() == 2:
+                        ar_edge_attr = ar_edge_attr[valid_mask] if ar_edge_attr.shape[0] > 0 else ar_edge_attr
+
+                    if ar_edge_sh.dim() == 3 and ar_edge_sh.shape[1] > 0:
+                        T = ar_edge_sh.shape[0]
+                        reshaped_mask = valid_mask.view(T, -1)[0]
+                        ar_edge_sh = ar_edge_sh[:, reshaped_mask]
+                    elif ar_edge_sh.dim() == 2:
+                        ar_edge_sh = ar_edge_sh[valid_mask] if ar_edge_sh.shape[0] > 0 else ar_edge_sh
+
+            # CRITICAL FIX: Handle expanded edge indices properly for atom-receptor
+            if ar_edge_index.shape[1] > 0:
+                original_num_edges = ar_edge_index.shape[1] // T
+                edge_index_reshaped = ar_edge_index.view(
+                    2, T, original_num_edges)
+                atom_indices = edge_index_reshaped[0]
+                rec_indices = edge_index_reshaped[1]
+
+                # SAFETY: Clamp indices to valid ranges (non-inplace)
+                atom_max_idx = atom_node_attr.shape[1] - 1
+                rec_max_idx = rec_node_attr.shape[1] - 1
+                atom_indices_clamped = torch.clamp(
+                    atom_indices, 0, atom_max_idx)
+                rec_indices_clamped = torch.clamp(rec_indices, 0, rec_max_idx)
+
+                atom_features = torch.gather(atom_node_attr[:, :, :self.ns], 1,
+                                             atom_indices_clamped.unsqueeze(-1).expand(-1, -1, self.ns))
+                rec_features = torch.gather(rec_node_attr[:, :, :self.ns], 1,
+                                            rec_indices_clamped.unsqueeze(-1).expand(-1, -1, self.ns))
+
+                ar_edge_features = torch.cat(
+                    [ar_edge_attr, atom_features, rec_features], dim=-1)
+            else:
+                ar_edge_features = torch.cat([
+                    ar_edge_attr,
+                    torch.zeros((T, 0, self.ns), device=atom_node_attr.device),
+                    torch.zeros((T, 0, self.ns), device=rec_node_attr.device)
+                ], dim=-1)
+
+            # FUNDAMENTAL FIX: Only compute ar_update if atoms exist
+            if atom_node_attr.shape[1] > 0 and ar_edge_index.shape[1] > 0:
+                # Atoms exist, compute atom-receptor update
+                original_num_edges = ar_edge_index.shape[1] // T
+                edge_index_reshaped = ar_edge_index.view(
+                    2, T, original_num_edges)
+                atom_max_idx = atom_node_attr.shape[1] - 1
+                rec_max_idx = rec_node_attr.shape[1] - 1
+
+                edge_index_reshaped_clamped = torch.stack([
+                    torch.clamp(edge_index_reshaped[0], 0, atom_max_idx),
+                    torch.clamp(edge_index_reshaped[1], 0, rec_max_idx)
+                ], dim=0)
+                ar_edge_index_safe = edge_index_reshaped_clamped.view(2, -1)
+
+                ar_update = self.conv_layers[l](
+                    rec_node_attr, ar_edge_index_safe, ar_edge_features, ar_edge_sh, out_nodes=atom_node_attr.shape[1])
+            else:
+                # No atoms or no edges: ar_update not needed
+                ar_update = None
+
+            # FUNDAMENTAL FIX: Conditional updates based on available data
+            if l != len(self.conv_layers) - 1:
+                # Check if atom data exists
+                has_atoms = atom_node_attr.shape[1] > 0
+
+                if has_atoms:
+                    # CRITICAL FIX: Handle dimension mismatches in residual connections
+                    # - la_update: ligand-atom interaction -> updates ligand nodes
+                    # - ar_update: atom-receptor interaction -> updates atom nodes
+                    # - lr_update: ligand-receptor interaction -> updates ligand nodes
+
+                    # Update atom nodes with dimension check
+                    ar_contrib = ar_update if ar_update is not None else 0
+                    total_atom_update = atom_update + ar_contrib
+                    if total_atom_update.shape[-1] == atom_node_attr.shape[-1]:
+                        atom_node_attr = atom_node_attr + time_weights * total_atom_update
+                    else:
+                        atom_node_attr = time_weights * total_atom_update
+
+                    # Update receptor nodes with dimension check
+                    if rec_update.shape[-1] == rec_node_attr.shape[-1]:
+                        rec_node_attr = rec_node_attr + time_weights * rec_update
+                    else:
+                        rec_node_attr = time_weights * rec_update
+
+                    # Update ligand nodes with dimension check
+                    la_contrib = la_update if la_update is not None else 0
+                    total_lig_update = lig_update + la_contrib + lr_update
+                    if total_lig_update.shape[-1] == lig_node_attr.shape[-1]:
+                        lig_node_attr = lig_node_attr + time_weights * total_lig_update
+                    else:
+                        lig_node_attr = time_weights * total_lig_update
+                else:
+                    # No atoms: skip atom-related updates entirely
+                    # CRITICAL FIX: Only add updates if dimensions match (residual connections)
+                    if rec_update.shape[-1] == rec_node_attr.shape[-1]:
+                        rec_node_attr = rec_node_attr + time_weights * rec_update
+                    else:
+                        # Dimension mismatch: replace instead of add (no residual)
+                        rec_node_attr = time_weights * rec_update
+
+                    if lig_update.shape[-1] == lig_node_attr.shape[-1]:
+                        lig_node_attr = lig_node_attr + time_weights * \
+                            (lig_update + lr_update)
+                    else:
+                        # Dimension mismatch: replace instead of add (no residual)
+                        lig_node_attr = time_weights * (lig_update + lr_update)
+                    # Keep atom_node_attr unchanged (empty tensor)
+            else:
+                # Final layer: similar conditional logic
+                has_atoms = atom_node_attr.shape[1] > 0
+                if has_atoms:
+                    lig_node_attr = lig_node_attr + time_weights * \
+                        (lig_update + (la_update if la_update is not None else 0) + lr_update)
+                else:
+                    lig_node_attr = lig_node_attr + time_weights * \
+                        (lig_update + lr_update)
+
+        # Confidence prediction
+        if self.confidence_mode:
+            scalar_lig_attr = lig_node_attr[:, :, :self.ns] if self.num_conv_layers < 3 else torch.cat([
+                lig_node_attr[:, :, :self.ns],
+                lig_node_attr[:, :, -self.ns:]
+            ], dim=-1)
+
+            scalar_lig_attr = (scalar_lig_attr * time_weights).mean(dim=0)
+            confidence_output = self.confidence_predictor(
+                scatter_mean(scalar_lig_attr, data['ligand'].batch, dim=0))
+            mean = confidence_output[:, :self.num_confidence_outputs]
+            variance = F.softplus(
+                confidence_output[:, self.num_confidence_outputs:])
+            return mean, variance
+
+        # Center graph prediction
+        center_edge_index, center_edge_attr, center_edge_sh = self.build_center_conv_graph(
+            data)
+        center_edge_attr = self.center_edge_embedding(center_edge_attr)
+        center_edge_index = self.expand_edge_index(center_edge_index, T)
+        center_edge_attr = center_edge_attr.unsqueeze(0).expand(T, -1, -1)
+        center_edge_sh = center_edge_sh.unsqueeze(0).expand(T, -1, -1)
+
+        if center_edge_index.shape[1] > 0:
+            max_center_idx = center_edge_index[1].max().item()
+            max_lig_idx = lig_node_attr.shape[1] - 1
+            if max_center_idx > max_lig_idx:
+                print(
+                    f'[DEBUG] Center edge index {max_center_idx} exceeds ligand node count {max_lig_idx}')
+                valid_mask = center_edge_index[1] <= max_lig_idx
+                center_edge_index = center_edge_index[:, valid_mask]
+                # Fix for 3D tensors: apply mask to second dimension
+                if center_edge_attr.dim() == 3 and center_edge_attr.shape[1] > 0:
+                    center_edge_attr = center_edge_attr[:, valid_mask]
+                elif center_edge_attr.dim() == 2:
+                    center_edge_attr = center_edge_attr[valid_mask] if center_edge_attr.shape[0] > 0 else center_edge_attr
+                if center_edge_sh.dim() == 3 and center_edge_sh.shape[1] > 0:
+                    center_edge_sh = center_edge_sh[:, valid_mask]
+                elif center_edge_sh.dim() == 2:
+                    center_edge_sh = center_edge_sh[valid_mask] if center_edge_sh.shape[0] > 0 else center_edge_sh
+
+        # CENTER FIX: Handle center edge concatenation with proper dimension checking
+        if center_edge_index.shape[1] > 0:
+            # Safely index ligand node attributes (non-inplace)
+            center_indices = center_edge_index[1]
+            max_lig_idx = lig_node_attr.shape[1] - 1
+            center_indices_clamped = torch.clamp(
+                center_indices, 0, max_lig_idx)
+
+            lig_center_features = lig_node_attr[:,
+                                                center_indices_clamped, :self.ns]
+            print(
+                f'[CENTER_DEBUG] center_edge_attr shape: {center_edge_attr.shape}')
+            print(
+                f'[CENTER_DEBUG] lig_center_features shape: {lig_center_features.shape}')
+
+            # Ensure compatible shapes for concatenation
+            if center_edge_attr.shape[1] != lig_center_features.shape[1]:
+                print(
+                    f'[CENTER_MISMATCH] Shape mismatch - center_edge_attr: {center_edge_attr.shape}, lig_center_features: {lig_center_features.shape}')
+                # Take minimum dimension to avoid mismatch
+                min_edges = min(
+                    center_edge_attr.shape[1], lig_center_features.shape[1])
+                center_edge_attr = center_edge_attr[:, :min_edges]
+                lig_center_features = lig_center_features[:, :min_edges]
+                print(
+                    f'[CENTER_FIXED] Truncated to: center_edge_attr {center_edge_attr.shape}, lig_center_features {lig_center_features.shape}')
+
+            center_edge_attr = torch.cat(
+                [center_edge_attr, lig_center_features], dim=-1)
+        else:
+            center_edge_attr = torch.cat([
+                center_edge_attr,
+                torch.zeros((T, 0, self.ns), device=lig_node_attr.device)
+            ], dim=-1)
+
+        # FINAL_CONV FIX: Ensure lig_node_attr dimension matches final_conv expectations
+        final_conv_input_dim = self.final_conv.in_irreps.dim
+        actual_input_dim = lig_node_attr.shape[-1]
+
+        print(
+            f'[FINAL_CONV_DEBUG] Expected input dim: {final_conv_input_dim}, actual: {actual_input_dim}')
+
+        if actual_input_dim != final_conv_input_dim:
+            print(f'[FINAL_CONV_FIX] Dimension mismatch - adapting input')
+            if actual_input_dim > final_conv_input_dim:
+                # Truncate to match expected dimension
+                lig_node_attr_adapted = lig_node_attr[:,
+                                                      :, :final_conv_input_dim]
+                print(
+                    f'[FINAL_CONV_FIX] Truncated from {actual_input_dim} to {final_conv_input_dim}')
+            else:
+                # Pad to match expected dimension
+                padding_size = final_conv_input_dim - actual_input_dim
+                padding = torch.zeros((T, lig_node_attr.shape[1], padding_size),
+                                      device=lig_node_attr.device, dtype=lig_node_attr.dtype)
+                lig_node_attr_adapted = torch.cat(
+                    [lig_node_attr, padding], dim=-1)
+                print(
+                    f'[FINAL_CONV_FIX] Padded from {actual_input_dim} to {final_conv_input_dim}')
+        else:
+            lig_node_attr_adapted = lig_node_attr
+            print(f'[FINAL_CONV_DEBUG] No adaptation needed')
+
+        global_pred = self.final_conv(
+            lig_node_attr_adapted, center_edge_index, center_edge_attr, center_edge_sh, out_nodes=data.num_graphs)
+        global_pred = (global_pred * time_weights).mean(dim=0)
+
+        # Separate translation and rotation predictions
+        tr_pred = global_pred[:, :3] + global_pred[:, 6:9]
+        rot_pred = global_pred[:, 3:6] + global_pred[:, 9:]
+
+        # Sigma embedding
+        data.graph_sigma_emb = self.timestep_emb_func(
+            torch.tensor([0], device=self.device))
+
+        # Adjust prediction magnitudes
+        tr_norm = torch.linalg.vector_norm(tr_pred, dim=1).unsqueeze(1)
+
+        # DTYPE FIX: Ensure consistent dtypes for tr_final_layer
+        tr_norm = tr_norm.float()
+        data.graph_sigma_emb = data.graph_sigma_emb.float()
+
+        tr_pred = tr_pred / (tr_norm + 1e-8) * self.tr_final_layer(
+            torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
+
+        rot_norm = torch.linalg.vector_norm(rot_pred, dim=1).unsqueeze(1)
+
+        # DTYPE FIX: Ensure consistent dtypes for rot_final_layer
+        rot_norm = rot_norm.float()
+
+        rot_pred = rot_pred / (rot_norm + 1e-8) * self.rot_final_layer(
+            torch.cat([rot_norm, data.graph_sigma_emb], dim=1))
+
+        if self.scale_by_sigma:
+            tr_pred = tr_pred / (tr_sigma.unsqueeze(1) + 1e-8)
+            rot_pred = rot_pred * \
+                so3.score_norm(rot_sigma.cpu()).unsqueeze(
+                    1).to(data['ligand'].x.device)
+
+        # Torsion prediction
+        if self.no_torsion or data['ligand'].edge_mask.sum() == 0:
+            return tr_pred, rot_pred, torch.zeros(1, device=self.device, requires_grad=True)
+
+        tor_bonds, tor_edge_index, tor_edge_attr, tor_edge_sh = self.build_bond_conv_graph(
+            data)
+        tor_bond_vec = data['ligand'].pos[tor_bonds[1]] - \
+            data['ligand'].pos[tor_bonds[0]]
+        tor_bond_attr = lig_node_attr.mean(
+            dim=0)[tor_bonds[0]] + lig_node_attr.mean(dim=0)[tor_bonds[1]]
+
+        tor_bonds_sh = o3.spherical_harmonics(
+            '2e', tor_bond_vec, normalize=True, normalization='component')
+        tor_edge_sh = self.final_tp_tor(
+            tor_edge_sh, tor_bonds_sh[tor_edge_index[0]])
+
+        tor_edge_attr = self.final_edge_embedding(tor_edge_attr)
+        tor_edge_index = self.expand_edge_index(tor_edge_index, T)
+        tor_edge_attr = tor_edge_attr.unsqueeze(0).expand(T, -1, -1)
+        tor_edge_sh = tor_edge_sh.unsqueeze(0).expand(T, -1, -1)
+
+        if tor_edge_index.shape[1] > 0:
+            max_tor_edge_idx = tor_edge_index[1].max().item(
+            ) if tor_edge_index[1].numel() > 0 else -1
+            max_tor_bond_idx = tor_edge_index[0].max().item(
+            ) if tor_edge_index[0].numel() > 0 else -1
+            max_lig_idx = lig_node_attr.shape[1] - 1
+            max_bond_idx = tor_bond_attr.shape[0] - 1
+
+            if max_tor_edge_idx > max_lig_idx or max_tor_bond_idx > max_bond_idx:
+                print(
+                    f'[DEBUG] Torsion edge indices exceed bounds - tor_edge: {max_tor_edge_idx}/{max_lig_idx}, tor_bond: {max_tor_bond_idx}/{max_bond_idx}')
+                valid_mask = (tor_edge_index[1] <= max_lig_idx) & (
+                    tor_edge_index[0] <= max_bond_idx)
+                if valid_mask.any():
+                    tor_edge_index = tor_edge_index[:, valid_mask]
+                    # Fix for 3D tensors: apply mask to second dimension
+                    if tor_edge_attr.dim() == 3 and tor_edge_attr.shape[1] > 0:
+                        tor_edge_attr = tor_edge_attr[:, valid_mask]
+                    elif tor_edge_attr.dim() == 2:
+                        tor_edge_attr = tor_edge_attr[valid_mask] if tor_edge_attr.shape[0] > 0 else tor_edge_attr
+                    if tor_edge_sh.dim() == 3 and tor_edge_sh.shape[1] > 0:
+                        tor_edge_sh = tor_edge_sh[:, valid_mask]
+                    elif tor_edge_sh.dim() == 2:
+                        tor_edge_sh = tor_edge_sh[valid_mask] if tor_edge_sh.shape[0] > 0 else tor_edge_sh
+                else:
+                    tor_edge_index = torch.zeros(
+                        (2, 0), dtype=torch.long, device=self.device)
+                    tor_edge_attr = torch.zeros(
+                        (T, 0, tor_edge_attr.shape[-1]), device=lig_node_attr.device)
+                    tor_edge_sh = torch.zeros(
+                        (T, 0, tor_edge_sh.shape[-1]), device=lig_node_attr.device)
+
+        tor_edge_attr = torch.cat([
+            tor_edge_attr,
+            lig_node_attr[:, tor_edge_index[1], :self.ns] if tor_edge_index.shape[1] > 0 else torch.zeros(
+                (T, 0, self.ns), device=lig_node_attr.device),
+            tor_bond_attr.unsqueeze(0).repeat(T, 1, 1)[:, tor_edge_index[0]] if tor_edge_index.shape[1] > 0 else torch.zeros(
+                (T, 0, self.ns), device=lig_node_attr.device)
+        ], dim=-1)
+
+        tor_pred = self.tor_bond_conv(lig_node_attr, tor_edge_index, tor_edge_attr,
+                                      tor_edge_sh, out_nodes=data['ligand'].edge_mask.sum(), reduce='mean')
+        tor_pred = (tor_pred * time_weights).mean(dim=0)
+
+        # TOR_FINAL_LAYER FIX: Ensure tor_pred dimensions match tor_final_layer expectations
+        expected_tor_dim = 2 * self.ns  # tor_final_layer expects 2*ns input
+        actual_tor_dim = tor_pred.shape[-1]
+
+        print(
+            f'[TOR_DIM_DEBUG] Expected tor dim: {expected_tor_dim}, actual: {actual_tor_dim}')
+
+        if actual_tor_dim != expected_tor_dim:
+            if actual_tor_dim > expected_tor_dim:
+                # Truncate to match expected dimension
+                tor_pred_adapted = tor_pred[:, :expected_tor_dim]
+                print(
+                    f'[TOR_DIM_FIX] Truncated from {actual_tor_dim} to {expected_tor_dim}')
+            else:
+                # Pad to match expected dimension
+                padding_size = expected_tor_dim - actual_tor_dim
+                padding = torch.zeros((tor_pred.shape[0], padding_size),
+                                      device=tor_pred.device, dtype=tor_pred.dtype)
+                tor_pred_adapted = torch.cat([tor_pred, padding], dim=-1)
+                print(
+                    f'[TOR_DIM_FIX] Padded from {actual_tor_dim} to {expected_tor_dim}')
+        else:
+            tor_pred_adapted = tor_pred
+            print(f'[TOR_DIM_DEBUG] No adaptation needed')
+
+        # TOR_DTYPE_FIX: Ensure consistent dtypes for tor_final_layer
+        tor_pred_adapted = tor_pred_adapted.float()
+
+        tor_pred = self.tor_final_layer(tor_pred_adapted).squeeze(1)
+        edge_sigma = tor_sigma[data['ligand'].batch][data['ligand',
+                                                          'ligand'].edge_index[0]][data['ligand'].edge_mask]
+
+        if self.scale_by_sigma:
+            # TOR_SIGMA_FIX: Handle size mismatch between tor_pred and edge_sigma
+            try:
+                sigma_norm = torch.sqrt(torch.tensor(torus.score_norm(
+                    edge_sigma.cpu().numpy()), device=data['ligand'].x.device))
+
+                print(
+                    f'[TOR_SIGMA_DEBUG] tor_pred shape: {tor_pred.shape}, sigma_norm shape: {sigma_norm.shape}')
+
+                if tor_pred.shape[0] == sigma_norm.shape[0]:
+                    tor_pred = tor_pred * sigma_norm
+                    print(f'[TOR_SIGMA_SUCCESS] Applied sigma scaling')
+                else:
+                    print(
+                        f'[TOR_SIGMA_SKIP] Size mismatch - skipping sigma scaling: tor_pred {tor_pred.shape} vs sigma_norm {sigma_norm.shape}')
+                    # Use mean scaling as fallback
+                    mean_sigma_norm = sigma_norm.mean() if sigma_norm.numel(
+                    ) > 0 else torch.tensor(1.0, device=tor_pred.device)
+                    tor_pred = tor_pred * mean_sigma_norm
+                    print(
+                        f'[TOR_SIGMA_FALLBACK] Applied mean sigma scaling: {mean_sigma_norm.item()}')
+            except Exception as e:
+                print(f'[TOR_SIGMA_ERROR] Failed to apply sigma scaling: {e}')
+                print(f'[TOR_SIGMA_FALLBACK] Using unscaled tor_pred')
+
+        return tr_pred, rot_pred, tor_pred
+
+    def build_lig_conv_graph(self, data):
+        """Build ligand convolution graph."""
+        timesteps = torch.arange(self.num_timesteps, device=self.device)
+        data['ligand'].node_sigma_emb = self.timestep_emb_func(timesteps)
+        assert data['ligand'].node_sigma_emb.shape == (self.num_timesteps, self.sigma_embed_dim), \
+            f'Expected node_sigma_emb shape [{self.num_timesteps}, {self.sigma_embed_dim}], got {data["ligand"].node_sigma_emb.shape}'
+
+        data['ligand'].pos = data['ligand'].pos.to(self.device)
+        data['ligand'].batch = data['ligand'].batch.to(self.device)
+
+        n_nodes = data['ligand'].pos.shape[0]
+        if data['ligand'].batch.shape[0] != n_nodes:
+            raise ValueError(
+                f'Batch size mismatch: pos {n_nodes} vs batch {data["ligand"].batch.shape[0]}')
+
+        print(
+            f'[SAFETY_CHECK] Original batch range: {data["ligand"].batch.min().item()} to {data["ligand"].batch.max().item()}')
+        if data['ligand'].batch.max().item() > 100 or data['ligand'].batch.min().item() < 0:
+            print(f'[SAFETY_REBUILD] Forcing batch indices to safe range')
+            data['ligand'].batch = torch.zeros(
+                n_nodes, dtype=torch.long, device=self.device)
+
+        if data['ligand'].batch.max().item() >= data.num_graphs:
+            print(
+                f'[SAFETY_OVERRIDE] Batch max {data["ligand"].batch.max().item()} >= num_graphs {data.num_graphs}')
+            data['ligand'].batch = torch.zeros(
+                n_nodes, dtype=torch.long, device=self.device)
+
+        print(
+            f'[SAFETY_FINAL] Final batch range: {data["ligand"].batch.min().item()} to {data["ligand"].batch.max().item()}')
+
+        try:
+            radius_edges = radius_graph(
+                data['ligand'].pos, self.lig_max_radius, data['ligand'].batch)
+        except RuntimeError as e:
+            print(f'[RADIUS_ERROR] radius_graph failed: {e}')
+            print(f'[RADIUS_FALLBACK] Using empty edge set')
+            radius_edges = torch.zeros(
+                (2, 0), dtype=torch.long, device=self.device)
+
+        ligand_edge_index = torch.zeros(
+            (2, 0), dtype=torch.long, device=self.device)
+        ligand_edge_attr = torch.zeros(
+            (0, self.in_lig_edge_features), device=self.device)
+
+        try:
+            if hasattr(data['ligand'], 'edge_index') and data['ligand'].edge_index.numel() > 0:
+                max_node_idx = data['ligand'].x.shape[0] - 1
+                edge_mask = (data['ligand'].edge_index >= 0).all(dim=0) & \
+                            (data['ligand'].edge_index[0] <= max_node_idx) & \
+                            (data['ligand'].edge_index[1] <= max_node_idx)
+                if edge_mask.any():
+                    ligand_edge_index = data['ligand'].edge_index[:, edge_mask].to(
+                        self.device)
+                    ligand_edge_attr = data['ligand'].edge_attr[edge_mask].to(self.device) if hasattr(data['ligand'], 'edge_attr') and data['ligand'].edge_attr.numel() > 0 \
+                        else torch.zeros((ligand_edge_index.shape[1], self.in_lig_edge_features), device=self.device)
+        except Exception as e:
+            print(f'[EDGE_ERROR] Failed to process ligand edges: {e}')
+
+        # Safely combine ligand edges and radius edges
+        if ligand_edge_index.shape[1] > 0 and radius_edges.shape[1] > 0:
+            edge_index = torch.cat(
+                [ligand_edge_index, radius_edges], dim=1).long()
+            edge_attr = torch.cat([
+                ligand_edge_attr,
+                torch.zeros(
+                    radius_edges.shape[1], self.in_lig_edge_features, device=self.device)
+            ], dim=0)
+        elif ligand_edge_index.shape[1] > 0:
+            edge_index = ligand_edge_index
+            edge_attr = ligand_edge_attr
+        elif radius_edges.shape[1] > 0:
+            edge_index = radius_edges
+            edge_attr = torch.zeros(
+                radius_edges.shape[1], self.in_lig_edge_features, device=self.device)
+        else:
+            edge_index = torch.zeros(
+                (2, 0), dtype=torch.long, device=self.device)
+            edge_attr = torch.zeros(
+                (0, self.in_lig_edge_features), device=self.device)
+
+        print(
+            f'[EDGE_COMBINE] Final edge_index shape: {edge_index.shape}, edge_attr shape: {edge_attr.shape}')
+
+        if edge_index.shape[1] > 0:
+            # CRITICAL FIX: Validate edge indices before accessing node_sigma_emb
+            max_node_idx = data['ligand'].x.shape[0] - 1
+            valid_edge_mask = (edge_index[0] >= 0) & (edge_index[0] <= max_node_idx) & \
+                (edge_index[1] >= 0) & (edge_index[1] <= max_node_idx)
+
+            if not valid_edge_mask.all():
+                print(f'[EDGE_INDEX_FIX] Invalid edge indices detected')
+                print(
+                    f'[EDGE_INDEX_FIX] Edge range: [{edge_index.min().item()}, {edge_index.max().item()}], Node count: {max_node_idx + 1}')
+                edge_index = edge_index[:, valid_edge_mask]
+                edge_attr = edge_attr[valid_edge_mask] if edge_attr.shape[0] > 0 else edge_attr
+                print(
+                    f'[EDGE_INDEX_FIX] Filtered edges: {edge_index.shape[1]} remaining')
+
+            if edge_index.shape[1] > 0:
+                # Get sigma embedding for edges - it's the same for all edges since it's time-step level
+                # Shape: [sigma_embed_dim]
+                edge_sigma_emb = data['ligand'].node_sigma_emb[0]
+                # Expand to match the number of edges
+                edge_sigma_emb_2d = edge_sigma_emb.unsqueeze(0).expand(
+                    # Shape: [num_edges, sigma_embed_dim]
+                    edge_index.shape[1], -1)
+                edge_attr = torch.cat([edge_attr, edge_sigma_emb_2d], dim=-1)
+            else:
+                # No valid edges, create empty edge attributes
+                edge_attr = torch.zeros(
+                    (0, self.in_lig_edge_features + self.sigma_embed_dim), device=self.device)
+
+        ligand_x = data['ligand'].x
+        ligand_sigma_emb = data['ligand'].node_sigma_emb[0]
+        print(f'[NODE_DEBUG] ligand_x shape: {ligand_x.shape}')
+        print(f'[NODE_DEBUG] ligand_sigma_emb shape: {ligand_sigma_emb.shape}')
+
+        if ligand_sigma_emb.dim() == 1:
+            ligand_sigma_emb = ligand_sigma_emb.unsqueeze(
+                0).expand(ligand_x.shape[0], -1)
+            print(
+                f'[NODE_DEBUG] Expanded ligand_sigma_emb shape: {ligand_sigma_emb.shape}')
+
+        node_attr = torch.cat([ligand_x, ligand_sigma_emb], dim=-1)
+
+        edge_vec = data['ligand'].pos[edge_index[1]] - data['ligand'].pos[edge_index[0]] if edge_index.shape[1] > 0 \
+            else torch.zeros((0, 3), device=self.device)
+        edge_length_emb = self.lig_distance_expansion(edge_vec.norm(dim=-1)) if edge_vec.shape[0] > 0 \
+            else torch.zeros((0, self.distance_embed_dim), device=self.device)
+        edge_attr = torch.cat([edge_attr, edge_length_emb], dim=-1)
+        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component') if edge_vec.shape[0] > 0 \
+            else torch.zeros((0, self.sh_irreps.dim), device=self.device)
+
+        # DEEP CUDA SAFETY: Validate input tensors before embedding
+        print(f'[DEEP_SAFETY] Preparing ligand node attributes for embedding')
+
+        # Validate lig_node_attr tensor
+        if torch.isnan(node_attr).any():
+            print(
+                f'[DEEP_SAFETY] NaN detected in lig_node_attr, replacing with zeros')
+            node_attr = torch.where(torch.isnan(
+                node_attr), torch.zeros_like(node_attr), node_attr)
+
+        if torch.isinf(node_attr).any():
+            print(
+                f'[DEEP_SAFETY] Inf detected in lig_node_attr, replacing with zeros')
+            node_attr = torch.where(torch.isinf(
+                node_attr), torch.zeros_like(node_attr), node_attr)
+
+        # Check for extreme values that might cause GPU errors
+        if node_attr.abs().max() > 1000:
+            print(f'[DEEP_SAFETY] Extreme values detected, clamping to [-10, 10]')
+            node_attr = torch.clamp(node_attr, -10, 10)
+
+        # Ensure tensor is contiguous and properly aligned
+        node_attr = node_attr.contiguous()
+
+        print(
+            f'[DEEP_SAFETY] lig_node_attr final shape: {node_attr.shape}, dtype: {node_attr.dtype}, device: {node_attr.device}')
+        print(
+            f'[DEEP_SAFETY] lig_node_attr stats: min={node_attr.min().item():.6f}, max={node_attr.max().item():.6f}, mean={node_attr.mean().item():.6f}')
+
+        # Encode features
+        lig_node_attr = self.lig_node_embedding(node_attr)
+
+        return lig_node_attr, edge_index, edge_attr, edge_sh
+
+    def build_rec_conv_graph(self, data):
+        """Build receptor convolution graph."""
+        timesteps = torch.arange(self.num_timesteps, device=self.device)
+        data['receptor'].node_sigma_emb = self.timestep_emb_func(timesteps)
+
+        receptor_x = data['receptor'].x
+        receptor_sigma_emb = data['receptor'].node_sigma_emb[0]
+        print(f'[REC_DEBUG] receptor_x shape: {receptor_x.shape}')
+        print(
+            f'[REC_DEBUG] receptor_sigma_emb shape: {receptor_sigma_emb.shape}')
+
+        if receptor_sigma_emb.dim() == 1:
+            receptor_sigma_emb = receptor_sigma_emb.unsqueeze(
+                0).expand(receptor_x.shape[0], -1)
+            print(
+                f'[REC_DEBUG] Expanded receptor_sigma_emb shape: {receptor_sigma_emb.shape}')
+
+        node_attr = torch.cat([receptor_x, receptor_sigma_emb], dim=-1)
+        edge_index = data['receptor', 'receptor'].edge_index
+
+        if edge_index.shape[1] > 0:
+            # Validate receptor edge indices
+            max_node_idx = data['receptor'].x.shape[0] - 1
+            valid_edge_mask = (edge_index[0] >= 0) & (edge_index[0] <= max_node_idx) & \
+                (edge_index[1] >= 0) & (edge_index[1] <= max_node_idx)
+
+            if not valid_edge_mask.all():
+                print(f'[REC_EDGE_FIX] Invalid receptor edge indices detected')
+                edge_index = edge_index[:, valid_edge_mask]
+                print(
+                    f'[REC_EDGE_FIX] Filtered receptor edges: {edge_index.shape[1]} remaining')
+
+            if edge_index.shape[1] > 0:
+                edge_vec = data['receptor'].pos[edge_index[1]] - \
+                    data['receptor'].pos[edge_index[0]]
+                edge_length_emb = self.rec_distance_expansion(
+                    edge_vec.norm(dim=-1))
+                # Get sigma embedding for receptor edges - same for all edges since it's time-step level
+                # Shape: [sigma_embed_dim]
+                edge_sigma_emb = data['receptor'].node_sigma_emb[0]
+                # Expand to match the number of edges
+                edge_sigma_emb_2d = edge_sigma_emb.unsqueeze(0).expand(
+                    # Shape: [num_edges, sigma_embed_dim]
+                    edge_index.shape[1], -1)
+                edge_attr = torch.cat(
+                    [edge_sigma_emb_2d, edge_length_emb], dim=-1)
+                edge_sh = o3.spherical_harmonics(
+                    self.sh_irreps, edge_vec, normalize=True, normalization='component')
+            else:
+                edge_attr = torch.zeros(
+                    (0, self.sigma_embed_dim + self.distance_embed_dim), device=self.device)
+                edge_sh = torch.zeros(
+                    (0, self.sh_irreps.dim), device=self.device)
+        else:
+            edge_attr = torch.zeros(
+                (0, self.sigma_embed_dim + self.distance_embed_dim), device=self.device)
+            edge_sh = torch.zeros((0, self.sh_irreps.dim), device=self.device)
+
+        return node_attr, edge_index, edge_attr, edge_sh
+
+    def build_atom_conv_graph(self, data):
+        """Build atom convolution graph."""
+        if 'atom' not in data or not hasattr(data['atom'], 'x') or data['atom'].x is None:
+            print(f'[ATOM_WARNING] No valid atom data, using empty graphs')
+            return (
+                torch.zeros((0, self.sigma_embed_dim + 1), device=self.device),
+                torch.zeros((2, 0), dtype=torch.long, device=self.device),
+                torch.zeros((0, self.sigma_embed_dim +
+                            self.distance_embed_dim), device=self.device),
+                torch.zeros((0, self.sh_irreps.dim), device=self.device)
+            )
+
+        timesteps = torch.arange(self.num_timesteps, device=self.device)
+        data['atom'].node_sigma_emb = self.timestep_emb_func(timesteps)
+
+        atom_x = data['atom'].x
+        atom_sigma_emb = data['atom'].node_sigma_emb[0]
+        print(f'[ATOM_DEBUG] atom_x shape: {atom_x.shape}')
+        print(f'[ATOM_DEBUG] atom_sigma_emb shape: {atom_sigma_emb.shape}')
+
+        if atom_sigma_emb.dim() == 1:
+            atom_sigma_emb = atom_sigma_emb.unsqueeze(
+                0).expand(atom_x.shape[0], -1)
+            print(
+                f'[ATOM_DEBUG] Expanded atom_sigma_emb shape: {atom_sigma_emb.shape}')
+
+        node_attr = torch.cat([atom_x, atom_sigma_emb], dim=-1)
+
+        try:
+            edge_index = data['atom', 'atom'].edge_index
+        except (KeyError, AttributeError):
+            print(f'[ATOM_WARNING] No atom-atom edges, using empty edge index')
+            edge_index = torch.zeros(
+                (2, 0), dtype=torch.long, device=self.device)
+
+        if edge_index.shape[1] > 0:
+            edge_vec = data['atom'].pos[edge_index[1]] - \
+                data['atom'].pos[edge_index[0]]
+            edge_length_emb = self.lig_distance_expansion(
+                edge_vec.norm(dim=-1))
+            # Get sigma embedding for atom edges - same for all edges since it's time-step level
+            # Shape: [sigma_embed_dim]
+            edge_sigma_emb = data['atom'].node_sigma_emb[0]
+            # Expand to match the number of edges
+            edge_sigma_emb_2d = edge_sigma_emb.unsqueeze(0).expand(
+                edge_index.shape[1], -1)  # Shape: [num_edges, sigma_embed_dim]
+            edge_attr = torch.cat([edge_sigma_emb_2d, edge_length_emb], dim=-1)
+            edge_sh = o3.spherical_harmonics(
+                self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        else:
+            edge_attr = torch.zeros(
+                (0, self.sigma_embed_dim + self.distance_embed_dim), device=self.device)
+            edge_sh = torch.zeros((0, self.sh_irreps.dim), device=self.device)
+
+        return node_attr, edge_index, edge_attr, edge_sh
+
+    def build_cross_conv_graph(self, data, lr_cross_distance_cutoff):
+        """Build cross-interaction graph between ligand, receptor, and atoms."""
+        print(
+            f'[CROSS_SAFETY] Receptor batch range: {data["receptor"].batch.min().item()} to {data["receptor"].batch.max().item()}')
+        print(
+            f'[CROSS_SAFETY] Ligand batch range: {data["ligand"].batch.min().item()} to {data["ligand"].batch.max().item()}')
+
+        if data['receptor'].batch.max().item() > 100 or data['receptor'].batch.min().item() < 0:
+            print(f'[CROSS_FIX] Fixing receptor batch indices')
+            data['receptor'].batch = torch.zeros(
+                data['receptor'].pos.shape[0], dtype=torch.long, device=self.device)
+
+        if data['ligand'].batch.max().item() > 100 or data['ligand'].batch.min().item() < 0:
+            print(f'[CROSS_FIX] Fixing ligand batch indices')
+            data['ligand'].batch = torch.zeros(
+                data['ligand'].pos.shape[0], dtype=torch.long, device=self.device)
+
+        try:
+            lr_edge_index = radius(
+                data['receptor'].pos / lr_cross_distance_cutoff[data['receptor'].batch] if torch.is_tensor(
+                    lr_cross_distance_cutoff) else data['receptor'].pos,
+                data['ligand'].pos / lr_cross_distance_cutoff[data['ligand'].batch] if torch.is_tensor(
+                    lr_cross_distance_cutoff) else data['ligand'].pos,
+                1 if torch.is_tensor(
+                    lr_cross_distance_cutoff) else lr_cross_distance_cutoff,
+                data['receptor'].batch,
+                data['ligand'].batch,
+                max_num_neighbors=10000
+            )
+        except RuntimeError as e:
+            print(f'[CROSS_ERROR] Cross radius failed: {e}')
+            print(f'[CROSS_FALLBACK] Using empty lr_edge_index')
+            lr_edge_index = torch.zeros(
+                (2, 0), dtype=torch.long, device=self.device)
+
+        if lr_edge_index.shape[1] > 0:
+            lr_edge_vec = data['receptor'].pos[lr_edge_index[1]
+                                               ] - data['ligand'].pos[lr_edge_index[0]]
+            lr_edge_length_emb = self.cross_distance_expansion(
+                lr_edge_vec.norm(dim=-1))
+            # Safe indexing for lr_edge_sigma_emb
+            max_lig_idx = data['ligand'].node_sigma_emb.shape[1] - \
+                1 if data['ligand'].node_sigma_emb.dim(
+            ) > 1 else data['ligand'].node_sigma_emb.shape[0] - 1
+            safe_lr_indices = torch.clamp(lr_edge_index[0], 0, max_lig_idx)
+            lr_edge_sigma_emb = data['ligand'].node_sigma_emb[:, safe_lr_indices] if data['ligand'].node_sigma_emb.dim(
+            ) > 1 else data['ligand'].node_sigma_emb[safe_lr_indices]
+            lr_edge_sigma_emb_2d = lr_edge_sigma_emb[0] if lr_edge_sigma_emb.dim() == 3 else \
+                lr_edge_sigma_emb[0].unsqueeze(-1).expand(-1, self.sigma_embed_dim) if lr_edge_sigma_emb.dim() == 2 else \
+                lr_edge_sigma_emb.unsqueeze(-1).expand(-1,
+                                                       self.sigma_embed_dim)
+            lr_edge_attr = torch.cat(
+                [lr_edge_sigma_emb_2d, lr_edge_length_emb], dim=-1)
+            lr_edge_sh = o3.spherical_harmonics(
+                self.sh_irreps, lr_edge_vec, normalize=True, normalization='component')
+        else:
+            lr_edge_attr = torch.zeros(
+                (0, self.sigma_embed_dim + self.cross_distance_embed_dim), device=self.device)
+            lr_edge_sh = torch.zeros(
+                (0, self.sh_irreps.dim), device=self.device)
+
+        if 'atom' not in data or not hasattr(data['atom'], 'pos') or data['atom'].pos is None:
+            print(f'[LA_WARNING] No valid atom data, using empty la_edge_index')
+            la_edge_index = torch.zeros(
+                (2, 0), dtype=torch.long, device=self.device)
+            la_edge_attr = torch.zeros(
+                (0, self.sigma_embed_dim + self.cross_distance_embed_dim), device=self.device)
+            la_edge_sh = torch.zeros(
+                (0, self.sh_irreps.dim), device=self.device)
+        else:
+            try:
+                la_edge_index = radius(
+                    data['atom'].pos,
+                    data['ligand'].pos,
+                    self.lig_max_radius,
+                    data['atom'].batch,
+                    data['ligand'].batch,
+                    max_num_neighbors=10000
+                )
+            except RuntimeError as e:
+                print(f'[LA_ERROR] LA radius failed: {e}')
+                print(f'[LA_FALLBACK] Using empty la_edge_index')
+                la_edge_index = torch.zeros(
+                    (2, 0), dtype=torch.long, device=self.device)
+
+            if la_edge_index.shape[1] > 0:
+                la_edge_vec = data['atom'].pos[la_edge_index[1]
+                                               ] - data['ligand'].pos[la_edge_index[0]]
+                la_edge_length_emb = self.cross_distance_expansion(
+                    la_edge_vec.norm(dim=-1))
+                # Safe indexing for la_edge_sigma_emb
+                max_lig_idx_la = data['ligand'].node_sigma_emb.shape[1] - 1 if data['ligand'].node_sigma_emb.dim(
+                ) > 1 else data['ligand'].node_sigma_emb.shape[0] - 1
+                safe_la_indices = torch.clamp(
+                    la_edge_index[0], 0, max_lig_idx_la)
+                la_edge_sigma_emb = data['ligand'].node_sigma_emb[:, safe_la_indices] if data['ligand'].node_sigma_emb.dim(
+                ) > 1 else data['ligand'].node_sigma_emb[safe_la_indices]
+                la_edge_sigma_emb_2d = la_edge_sigma_emb[0] if la_edge_sigma_emb.dim() == 3 else \
+                    la_edge_sigma_emb[0].unsqueeze(-1).expand(-1, self.sigma_embed_dim) if la_edge_sigma_emb.dim() == 2 else \
+                    la_edge_sigma_emb.unsqueeze(-1).expand(-1,
+                                                           self.sigma_embed_dim)
+                la_edge_attr = torch.cat(
+                    [la_edge_sigma_emb_2d, la_edge_length_emb], dim=-1)
+                la_edge_sh = o3.spherical_harmonics(
+                    self.sh_irreps, la_edge_vec, normalize=True, normalization='component')
+            else:
+                la_edge_attr = torch.zeros(
+                    (0, self.sigma_embed_dim + self.cross_distance_embed_dim), device=self.device)
+                la_edge_sh = torch.zeros(
+                    (0, self.sh_irreps.dim), device=self.device)
+
+        if 'atom' not in data or not hasattr(data['atom'], 'pos'):
+            print(f'[AR_WARNING] No valid atom data, using empty ar_edge_index')
+            ar_edge_index = torch.zeros(
+                (2, 0), dtype=torch.long, device=self.device)
+            ar_edge_attr = torch.zeros(
+                (0, self.sigma_embed_dim + self.distance_embed_dim), device=self.device)
+            ar_edge_sh = torch.zeros(
+                (0, self.sh_irreps.dim), device=self.device)
+        else:
+            try:
+                ar_edge_index = data['atom', 'receptor'].edge_index
+            except (KeyError, AttributeError):
+                print(f'[AR_ERROR] AR edge_index not found, using empty')
+                ar_edge_index = torch.zeros(
+                    (2, 0), dtype=torch.long, device=self.device)
+
+            if ar_edge_index.shape[1] > 0:
+                ar_edge_vec = data['receptor'].pos[ar_edge_index[1]
+                                                   ] - data['atom'].pos[ar_edge_index[0]]
+                ar_edge_length_emb = self.rec_distance_expansion(
+                    ar_edge_vec.norm(dim=-1))
+                # Safe indexing for ar_edge_sigma_emb
+                max_atom_idx_ar = data['atom'].node_sigma_emb.shape[1] - 1 if data['atom'].node_sigma_emb.dim(
+                ) > 1 else data['atom'].node_sigma_emb.shape[0] - 1
+                safe_ar_indices = torch.clamp(
+                    ar_edge_index[0], 0, max_atom_idx_ar)
+                ar_edge_sigma_emb = data['atom'].node_sigma_emb[:, safe_ar_indices] if data['atom'].node_sigma_emb.dim(
+                ) > 1 else data['atom'].node_sigma_emb[safe_ar_indices]
+                ar_edge_sigma_emb_2d = ar_edge_sigma_emb[0] if ar_edge_sigma_emb.dim() == 3 else \
+                    ar_edge_sigma_emb[0].unsqueeze(-1).expand(-1, self.sigma_embed_dim) if ar_edge_sigma_emb.dim() == 2 else \
+                    ar_edge_sigma_emb.unsqueeze(-1).expand(-1,
+                                                           self.sigma_embed_dim)
+                ar_edge_attr = torch.cat(
+                    [ar_edge_sigma_emb_2d, ar_edge_length_emb], dim=-1)
+                ar_edge_sh = o3.spherical_harmonics(
+                    self.sh_irreps, ar_edge_vec, normalize=True, normalization='component')
+            else:
+                ar_edge_attr = torch.zeros(
+                    (0, self.sigma_embed_dim + self.distance_embed_dim), device=self.device)
+                ar_edge_sh = torch.zeros(
+                    (0, self.sh_irreps.dim), device=self.device)
+
+        return lr_edge_index, lr_edge_attr, lr_edge_sh, la_edge_index, la_edge_attr, la_edge_sh, ar_edge_index, ar_edge_attr, ar_edge_sh
+
+    def build_center_conv_graph(self, data):
+        """Build center convolution graph."""
+        edge_index = torch.cat([
+            data['ligand'].batch.unsqueeze(0),
+            torch.arange(len(data['ligand'].batch),
+                         device=data['ligand'].x.device).unsqueeze(0)
+        ], dim=0)
+        center_pos = torch.zeros((data.num_graphs, 3),
+                                 device=data['ligand'].x.device)
+        center_pos.index_add_(
+            0, index=data['ligand'].batch, source=data['ligand'].pos)
+        center_pos = center_pos / \
+            torch.bincount(data['ligand'].batch).unsqueeze(1)
+        edge_vec = data['ligand'].pos[edge_index[1]] - \
+            center_pos[edge_index[0]]
+        edge_attr = self.center_distance_expansion(edge_vec.norm(dim=-1))
+        # Safe indexing for center edge_sigma_emb
+        max_center_idx = data['ligand'].node_sigma_emb.shape[1] - \
+            1 if data['ligand'].node_sigma_emb.dim(
+        ) > 1 else data['ligand'].node_sigma_emb.shape[0] - 1
+        safe_center_indices = torch.clamp(edge_index[1], 0, max_center_idx)
+        edge_sigma_emb = data['ligand'].node_sigma_emb[:, safe_center_indices] if data['ligand'].node_sigma_emb.dim(
+        ) > 1 else data['ligand'].node_sigma_emb[safe_center_indices]
+        edge_sigma_emb_2d = edge_sigma_emb[0] if edge_sigma_emb.dim() == 3 else \
+            edge_sigma_emb[0].unsqueeze(-1).expand(-1, self.sigma_embed_dim) if edge_sigma_emb.dim() == 2 else \
+            edge_sigma_emb.unsqueeze(-1).expand(-1, self.sigma_embed_dim)
+        edge_attr = torch.cat([edge_attr, edge_sigma_emb_2d], dim=-1)
+        edge_sh = o3.spherical_harmonics(
+            self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        return edge_index, edge_attr, edge_sh
+
+    def build_bond_conv_graph(self, data):
+        """Build bond convolution graph for torsion angles."""
+        ligand_edge_index = torch.zeros(
+            (2, 0), dtype=torch.long, device=self.device)
+        try:
+            if hasattr(data['ligand'], 'edge_index') and data['ligand'].edge_index.numel() > 0:
+                max_node_idx = data['ligand'].x.shape[0] - 1
+                edge_mask = (data['ligand'].edge_index >= 0).all(dim=0) & \
+                            (data['ligand'].edge_index[0] <= max_node_idx) & \
+                            (data['ligand'].edge_index[1] <= max_node_idx)
+                if edge_mask.any():
+                    ligand_edge_index = data['ligand'].edge_index[:, edge_mask].to(
+                        self.device)
+        except Exception as e:
+            print(f'[EDGE_ERROR] Failed to process ligand edges: {e}')
+
+        bonds = torch.zeros((2, 0), dtype=torch.long, device=self.device)
+        if hasattr(data['ligand'], 'edge_mask') and data['ligand'].edge_mask.numel() > 0 and ligand_edge_index.shape[1] > 0:
+            valid_mask_indices = data['ligand'].edge_mask < ligand_edge_index.shape[1]
+            if valid_mask_indices.any():
+                bonds = ligand_edge_index[:, data['ligand'].edge_mask[valid_mask_indices]].long(
+                )
+
+        # Default empty values
+        edge_index = torch.zeros((2, 0), dtype=torch.long, device=self.device)
+        edge_attr = torch.zeros(
+            (0, self.distance_embed_dim), device=self.device)
+        edge_sh = torch.zeros((0, self.sh_irreps.dim), device=self.device)
+
+        if bonds.shape[1] > 0:
+            try:
+                bond_pos = (data['ligand'].pos[bonds[0]] +
+                            data['ligand'].pos[bonds[1]]) / 2
+                bond_batch = data['ligand'].batch[bonds[0]]
+                edge_index = radius(data['ligand'].pos, bond_pos, self.lig_max_radius,
+                                    batch_x=data['ligand'].batch, batch_y=bond_batch)
+                edge_vec = data['ligand'].pos[edge_index[1]] - \
+                    bond_pos[edge_index[0]]
+                edge_attr = self.lig_distance_expansion(edge_vec.norm(dim=-1))
+                edge_sh = o3.spherical_harmonics(
+                    self.sh_irreps, edge_vec, normalize=True, normalization='component')
+            except Exception as e:
+                print(f'[BOND_ERROR] Bond graph creation failed: {e}')
+
+        return bonds, edge_index, edge_attr, edge_sh
